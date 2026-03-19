@@ -12,7 +12,7 @@ from uuid import uuid4
 import cv2
 import mediapipe as mp
 import numpy as np
-from ai_edge_litert.interpreter import Interpreter
+import tensorflow as tf
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -100,7 +100,7 @@ if not MODEL_PATH.exists():
 
 CLASS_NAMES = load_label_map(LABEL_MAP_PATH)
 
-interpreter = Interpreter(model_path=str(MODEL_PATH))
+interpreter = tf.lite.Interpreter(model_path=str(MODEL_PATH))
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()

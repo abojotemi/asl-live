@@ -2,4 +2,4 @@ fastapi[standard]
 numpy
 opencv-python-headless<4.11
 mediapipe==0.10.14
-ai-edge-litert
+tensorflow-cpu==2.18.0
