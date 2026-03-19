@@ -22,6 +22,7 @@
 	let confidence = 0;
 	let framesCollected = 0;
 	let errorMessage = '';
+	let backendConnected = false;
 
 	const confidencePct = () => `${(confidence * 100).toFixed(1)}%`;
 
@@ -90,18 +91,24 @@
 	async function sendFrame() {
 		if (!started || busy) return;
 		const imageBase64 = captureBase64();
-		if (!imageBase64) return;
+		if (!imageBase64) {
+			console.warn('Failed to capture frame');
+			return;
+		}
 
 		busy = true;
 		try {
+			const payload = { image_base64: imageBase64, session_id: sessionId };
+			console.log(`Sending frame ${framesCollected + 1}...`);
+			
 			const response = await fetch(`${API_BASE}/predict`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ image_base64: imageBase64, session_id: sessionId })
+				body: JSON.stringify(payload)
 			});
 
 			if (!response.ok) {
-				throw new Error(`API ${response.status}`);
+				throw new Error(`API error ${response.status}: ${response.statusText}`);
 			}
 
 			const data = await response.json();
@@ -110,8 +117,11 @@
 			confidence = data.confidence;
 			framesCollected = data.frames_collected;
 			errorMessage = '';
+			console.log(`Frame received: ${prediction} (${(confidence * 100).toFixed(1)}%)`);
 		} catch (error) {
-			errorMessage = `Inference error: ${error instanceof Error ? error.message : String(error)}`;
+			const msg = error instanceof Error ? error.message : String(error);
+			errorMessage = `Inference error: ${msg}`;
+			console.error('sendFrame error:', msg);
 		} finally {
 			busy = false;
 		}
@@ -122,7 +132,30 @@
 		timer = window.setInterval(sendFrame, CAPTURE_INTERVAL_MS);
 	}
 
-	onMount(() => {
+	async function checkBackendHealth() {
+		try {
+			const response = await fetch(`${API_BASE}/health`);
+			if (response.ok) {
+				backendConnected = true;
+				console.log('✓ Backend connected:', API_BASE);
+				return true;
+			} else {
+				backendConnected = false;
+				errorMessage = `Backend error: ${response.status}`;
+				console.error('Backend health check failed:', response.status);
+				return false;
+			}
+		} catch (error) {
+			backendConnected = false;
+			errorMessage = `Cannot reach backend: ${error instanceof Error ? error.message : String(error)}`;
+			console.error('Backend connection failed:', error);
+			return false;
+		}
+	}
+
+	onMount(async () => {
+		console.log('App loaded. API_BASE:', API_BASE);
+		await checkBackendHealth();
 		return () => stopCamera();
 	});
 
@@ -134,6 +167,18 @@
 <main class="container">
 	<h1>ASL Live Word Predictor</h1>
 	<p class="subtitle">Shows live prediction for: hello, thankyou, yes, no, sorry.</p>
+
+	<div class="status">
+		<span class="status-indicator" class:connected={backendConnected}></span>
+		<span class="status-text">
+			{#if backendConnected}
+				✓ Backend connected
+			{:else}
+				✗ Backend offline
+			{/if}
+		</span>
+		<span class="api-url">{API_BASE}</span>
+	</div>
 
 	<div class="panel">
 		<video bind:this={videoEl} playsinline muted></video>
@@ -173,6 +218,40 @@
 	.subtitle {
 		opacity: 0.8;
 		margin-bottom: 1rem;
+	}
+
+	.status {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin-bottom: 1rem;
+		padding: 0.5rem 0.75rem;
+		background: #f0f0f0;
+		border-radius: 8px;
+		font-size: 0.9rem;
+	}
+
+	.status-indicator {
+		width: 10px;
+		height: 10px;
+		border-radius: 50%;
+		background: #dc2626;
+		transition: background 0.3s;
+	}
+
+	.status-indicator.connected {
+		background: #16a34a;
+	}
+
+	.status-text {
+		font-weight: 600;
+		flex: 1;
+	}
+
+	.api-url {
+		font-size: 0.75rem;
+		opacity: 0.6;
+		font-family: monospace;
 	}
 
 	.panel {
