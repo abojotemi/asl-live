@@ -217,9 +217,9 @@
 		</div>
 
 		<div class="buttons">
-			<button on:click={startCamera} disabled={started}>Start camera</button>
-			<button on:click={stopCamera} disabled={!started}>Stop</button>
-			<button on:click={resetSession}>Reset session</button>
+			<button onclick={startCamera} disabled={started}>Start camera</button>
+			<button onclick={stopCamera} disabled={!started}>Stop</button>
+			<button onclick={resetSession}>Reset session</button>
 		</div>
 
 		{#if errorMessage}

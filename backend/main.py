@@ -4,6 +4,7 @@ import base64
 import json
 import threading
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List
 from uuid import uuid4
@@ -11,7 +12,7 @@ from uuid import uuid4
 import cv2
 import mediapipe as mp
 import numpy as np
-import tensorflow as tf
+from ai_edge_litert.interpreter import Interpreter
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -94,27 +95,12 @@ def extract_hand_vector_from_frame(
     return np.concatenate([left.reshape(-1), right.reshape(-1)], axis=0)
 
 
-app = FastAPI(title="ASL Live Inference API", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:8000",
-        "https://asl-live.vercel.app",
-    ],
-    allow_origin_regex=r"https://.*\.vercel\.app",
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 if not MODEL_PATH.exists():
     raise RuntimeError(f"TFLite model not found at {MODEL_PATH}")
 
 CLASS_NAMES = load_label_map(LABEL_MAP_PATH)
 
-interpreter = tf.lite.Interpreter(model_path=str(MODEL_PATH))
+interpreter = Interpreter(model_path=str(MODEL_PATH))
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
@@ -131,9 +117,28 @@ session_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_FRAMES)
 inference_lock = threading.Lock()
 
 
-@app.on_event("shutdown")
-def on_shutdown() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: nothing extra needed
+    yield
+    # Shutdown: release MediaPipe resources
     hands_model.close()
+
+
+app = FastAPI(title="ASL Live Inference API", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:8000",
+        "https://asl-live.vercel.app",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
