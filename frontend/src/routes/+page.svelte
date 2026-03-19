@@ -1,7 +1,12 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 
-	const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || 'http://localhost:8000';
+	// Use environment variable if set, otherwise detect production vs dev
+	const API_BASE =
+		(import.meta.env.VITE_API_BASE_URL as string) ||
+		(typeof window !== 'undefined' && window.location.hostname !== 'localhost'
+			? 'https://asl-live.onrender.com'
+			: 'http://localhost:8000');
 	const CAPTURE_INTERVAL_MS = 180;
 
 	let videoEl: HTMLVideoElement;
