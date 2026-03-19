@@ -13,6 +13,7 @@
 	let canvasEl: HTMLCanvasElement;
 	let stream: MediaStream | null = null;
 	let timer: number | null = null;
+	let healthTimer: number | null = null;
 
 	let started = false;
 	let busy = false;
@@ -116,10 +117,12 @@
 			prediction = data.prediction;
 			confidence = data.confidence;
 			framesCollected = data.frames_collected;
+			backendConnected = true;
 			errorMessage = '';
 			console.log(`Frame received: ${prediction} (${(confidence * 100).toFixed(1)}%)`);
 		} catch (error) {
 			const msg = error instanceof Error ? error.message : String(error);
+			backendConnected = false;
 			errorMessage = `Inference error: ${msg}`;
 			console.error('sendFrame error:', msg);
 		} finally {
@@ -133,11 +136,21 @@
 	}
 
 	async function checkBackendHealth() {
+		const controller = new AbortController();
+		const timeoutId = window.setTimeout(() => controller.abort(), 10000);
 		try {
-			const response = await fetch(`${API_BASE}/health`);
+			const response = await fetch(`${API_BASE}/health`, {
+				method: 'GET',
+				headers: { Accept: 'application/json' },
+				signal: controller.signal,
+				cache: 'no-store'
+			});
 			if (response.ok) {
 				backendConnected = true;
 				console.log('✓ Backend connected:', API_BASE);
+				if (!started && errorMessage.startsWith('Cannot reach backend')) {
+					errorMessage = '';
+				}
 				return true;
 			} else {
 				backendConnected = false;
@@ -147,19 +160,32 @@
 			}
 		} catch (error) {
 			backendConnected = false;
-			errorMessage = `Cannot reach backend: ${error instanceof Error ? error.message : String(error)}`;
+			if (!started) {
+				errorMessage = 'Warming backend... this can take up to a minute on Render cold starts.';
+			} else {
+				errorMessage = `Cannot reach backend: ${error instanceof Error ? error.message : String(error)}`;
+			}
 			console.error('Backend connection failed:', error);
 			return false;
+		} finally {
+			window.clearTimeout(timeoutId);
 		}
 	}
 
-	onMount(async () => {
+	onMount(() => {
 		console.log('App loaded. API_BASE:', API_BASE);
-		await checkBackendHealth();
+		void checkBackendHealth();
+		healthTimer = window.setInterval(() => {
+			void checkBackendHealth();
+		}, 15000);
 		return () => stopCamera();
 	});
 
 	onDestroy(() => {
+		if (healthTimer) {
+			window.clearInterval(healthTimer);
+			healthTimer = null;
+		}
 		stopCamera();
 	});
 </script>
