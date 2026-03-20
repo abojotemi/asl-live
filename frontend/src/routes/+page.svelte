@@ -206,6 +206,16 @@
 		}
 	}
 
+	function speakPrediction(text: string) {
+		if ("speechSynthesis" in window) {
+			window.speechSynthesis.cancel();
+			const utterance = new SpeechSynthesisUtterance(text);
+			utterance.rate = 0.9;
+			utterance.pitch = 1.0;
+			window.speechSynthesis.speak(utterance);
+		}
+	}
+
 	onMount(() => {
 		void checkBackendHealth();
 		healthTimer = setInterval(() => void checkBackendHealth(), 10000);
@@ -485,11 +495,36 @@
 								Need clearer motion
 							</p>
 						{:else}
-							<span
-								class="text-5xl font-black text-white capitalize tracking-tight drop-shadow-md"
+							<div
+								class="flex flex-col items-center gap-4"
 								in:scale={{ start: 0.8, duration: 400 }}
-								>{prediction}</span
 							>
+								<span
+									class="text-5xl font-black text-white capitalize tracking-tight drop-shadow-md"
+								>
+									{prediction}
+								</span>
+								<button
+									onclick={() => speakPrediction(prediction)}
+									class="flex items-center justify-center w-12 h-12 rounded-full bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 hover:text-indigo-300 border border-indigo-500/20 hover:border-indigo-500/40 transition-all duration-300 active:scale-95 group"
+									aria-label="Play audio pronunciation"
+									title="Play audio"
+								>
+									<svg
+										class="w-6 h-6 group-hover:scale-110 transition-transform"
+										fill="none"
+										stroke="currentColor"
+										viewBox="0 0 24 24"
+									>
+										<path
+											stroke-linecap="round"
+											stroke-linejoin="round"
+											stroke-width="2"
+											d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.5 10.5h4l5-5v13l-5-5h-4v-3z"
+										/>
+									</svg>
+								</button>
+							</div>
 						{/if}
 					</div>
 				</div>
