@@ -135,7 +135,7 @@
 
 		// Loop safely, waiting between requests to avoid overwhelming the server
 		if (started) {
-			captureLoopTimer = setTimeout(captureFrameIteration, 120); // ~8 FPS limit
+			captureLoopTimer = setTimeout(captureFrameIteration, 10); // increased speed
 		} else {
 			isCapturing = false;
 		}
@@ -207,13 +207,9 @@
 	}
 
 	function speakPrediction(text: string) {
-		if ("speechSynthesis" in window) {
-			window.speechSynthesis.cancel();
-			const utterance = new SpeechSynthesisUtterance(text);
-			utterance.rate = 0.9;
-			utterance.pitch = 1.0;
-			window.speechSynthesis.speak(utterance);
-		}
+		const url = `${API_BASE}/tts?text=${encodeURIComponent(text)}`;
+		const audio = new Audio(url);
+		audio.play().catch((err) => console.error("Audio play failed:", err));
 	}
 
 	onMount(() => {

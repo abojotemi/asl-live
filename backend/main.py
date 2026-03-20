@@ -10,11 +10,14 @@ from typing import Dict, List
 from uuid import uuid4
 
 import cv2
+import io
 import mediapipe as mp
 import numpy as np
 import tensorflow as tf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from gtts import gTTS
 from pydantic import BaseModel, Field
 
 MAX_FRAMES = 40
@@ -155,6 +158,19 @@ async def health() -> dict:
 async def reset_session(payload: ResetRequest) -> dict:
     session_buffers.pop(payload.session_id, None)
     return {"ok": True}
+
+
+@app.get("/tts")
+async def text_to_speech(text: str = Query(..., description="Text to speak")):
+    """Generates speech audio using Google TTS API"""
+    try:
+        tts = gTTS(text=text, lang="en", tld="com")
+        fp = io.BytesIO()
+        tts.write_to_fp(fp)
+        fp.seek(0)
+        return StreamingResponse(fp, media_type="audio/mpeg")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="TTS generation failed") from exc
 
 
 @app.post("/predict", response_model=PredictResponse)
