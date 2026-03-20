@@ -142,7 +142,7 @@ app.add_middleware(
 
 
 @app.get("/health")
-def health() -> dict:
+async def health() -> dict:
     return {
         "status": "ok",
         "classes": CLASS_NAMES,
@@ -152,9 +152,8 @@ def health() -> dict:
 
 
 @app.post("/reset")
-def reset_session(payload: ResetRequest) -> dict:
-    if payload.session_id in session_buffers:
-        session_buffers[payload.session_id].clear()
+async def reset_session(payload: ResetRequest) -> dict:
+    session_buffers.pop(payload.session_id, None)
     return {"ok": True}
 
 
