@@ -206,10 +206,32 @@
 		}
 	}
 
-	function speakPrediction(text: string) {
-		const url = `${API_BASE}/tts?text=${encodeURIComponent(text)}`;
-		const audio = new Audio(url);
-		audio.play().catch((err) => console.error("Audio play failed:", err));
+	let isSpeaking = $state(false);
+
+	async function speakPrediction(text: string) {
+		if (isSpeaking) return;
+		isSpeaking = true;
+		try {
+			const res = await fetch(
+				`${API_BASE}/tts?text=${encodeURIComponent(text)}`,
+			);
+			if (!res.ok) throw new Error(`TTS request failed: ${res.status}`);
+			const blob = await res.blob();
+			const blobUrl = URL.createObjectURL(blob);
+			const audio = new Audio(blobUrl);
+			audio.onended = () => {
+				URL.revokeObjectURL(blobUrl);
+				isSpeaking = false;
+			};
+			audio.onerror = () => {
+				URL.revokeObjectURL(blobUrl);
+				isSpeaking = false;
+			};
+			await audio.play();
+		} catch (err) {
+			console.error("Audio play failed:", err);
+			isSpeaking = false;
+		}
 	}
 
 	onMount(() => {
