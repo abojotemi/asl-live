@@ -207,9 +207,27 @@
 	}
 
 	function speakPrediction(text: string) {
-		const utterance = new SpeechSynthesisUtterance(text);
-		utterance.rate = 0.9;
-		window.speechSynthesis.speak(utterance);
+		window.speechSynthesis.cancel();
+
+		function doSpeak() {
+			const utterance = new SpeechSynthesisUtterance(text);
+			utterance.rate = 0.9;
+			window.speechSynthesis.speak(utterance);
+		}
+
+		// Voices load asynchronously in Chrome/Edge — if none are loaded yet,
+		// wait for the voiceschanged event before speaking.
+		if (window.speechSynthesis.getVoices().length > 0) {
+			doSpeak();
+		} else {
+			window.speechSynthesis.addEventListener(
+				"voiceschanged",
+				() => doSpeak(),
+				{ once: true },
+			);
+			// Trigger voice loading
+			window.speechSynthesis.getVoices();
+		}
 	}
 
 	onMount(() => {
