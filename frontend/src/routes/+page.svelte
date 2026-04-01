@@ -211,16 +211,32 @@
 		}
 	}
 
-	function speakPrediction(text: string) {
-		window.speechSynthesis.cancel();
-		isSpeaking = true;
+	// function speakPrediction(text: string) {
+	// 	window.speechSynthesis.cancel();
+	// 	isSpeaking = true;
 
-		const utterance = new SpeechSynthesisUtterance(text);
-		utterance.rate = 0.9;
-		utterance.onend = () => { isSpeaking = false; };
-		utterance.onerror = () => { isSpeaking = false; };
-		window.speechSynthesis.speak(utterance);
-	}
+	// 	const utterance = new SpeechSynthesisUtterance(text);
+	// 	utterance.rate = 0.9;
+	// 	utterance.onend = () => {
+	// 		isSpeaking = false;
+	// 	};
+	// 	utterance.onerror = () => {
+	// 		isSpeaking = false;
+	// 	};
+	// 	window.speechSynthesis.speak(utterance);
+	// }
+	function speakPrediction(text: string) {
+    window.speechSynthesis.cancel();
+    isSpeaking = true;
+
+    setTimeout(() => {
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.rate = 0.9;
+        utterance.onend = () => { isSpeaking = false; };
+        utterance.onerror = () => { isSpeaking = false; };
+        window.speechSynthesis.speak(utterance);
+    }, 100);
+}
 
 	onMount(() => {
 		void checkBackendHealth();
