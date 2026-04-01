@@ -92,6 +92,8 @@
 		return dataUrl.split(",")[1] ?? null; // Strip the `data:image/jpeg;base64,` header
 	}
 
+	let isSpeaking = false;
+
 	async function captureFrameIteration() {
 		if (!started) {
 			isCapturing = false;
@@ -99,43 +101,46 @@
 		}
 
 		isCapturing = true;
-		const imageBase64 = captureBase64();
 
-		if (imageBase64) {
-			try {
-				if (abortController) abortController.abort();
-				abortController = new AbortController();
+		// Skip inference while audio is playing to avoid interfering with playback
+		if (!isSpeaking) {
+			const imageBase64 = captureBase64();
 
-				const payload = {
-					image_base64: imageBase64,
-					session_id: sessionId,
-				};
-				const response = await fetch(`${API_BASE}/predict`, {
-					method: "POST",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify(payload),
-					signal: abortController.signal,
-				});
+			if (imageBase64) {
+				try {
+					if (abortController) abortController.abort();
+					abortController = new AbortController();
 
-				if (response.ok) {
-					const data = await response.json();
-					sessionId = data.session_id;
-					prediction = data.prediction;
-					confidence = data.confidence;
-					framesCollected = data.frames_collected;
-					errorMessage = "";
-				}
-			} catch (error: any) {
-				if (error.name !== "AbortError") {
-					console.error("Inference error:", error);
-					// Don't overwhelm the user with individual dropped frame errors, but note if completely dead.
+					const payload = {
+						image_base64: imageBase64,
+						session_id: sessionId,
+					};
+					const response = await fetch(`${API_BASE}/predict`, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify(payload),
+						signal: abortController.signal,
+					});
+
+					if (response.ok) {
+						const data = await response.json();
+						sessionId = data.session_id;
+						prediction = data.prediction;
+						confidence = data.confidence;
+						framesCollected = data.frames_collected;
+						errorMessage = "";
+					}
+				} catch (error: any) {
+					if (error.name !== "AbortError") {
+						console.error("Inference error:", error);
+					}
 				}
 			}
 		}
 
-		// Loop safely, waiting between requests to avoid overwhelming the server
+		// Loop at a calmer pace to avoid overwhelming the browser and server
 		if (started) {
-			captureLoopTimer = setTimeout(captureFrameIteration, 10); // increased speed
+			captureLoopTimer = setTimeout(captureFrameIteration, 200);
 		} else {
 			isCapturing = false;
 		}
@@ -208,26 +213,13 @@
 
 	function speakPrediction(text: string) {
 		window.speechSynthesis.cancel();
+		isSpeaking = true;
 
-		function doSpeak() {
-			const utterance = new SpeechSynthesisUtterance(text);
-			utterance.rate = 0.9;
-			window.speechSynthesis.speak(utterance);
-		}
-
-		// Voices load asynchronously in Chrome/Edge — if none are loaded yet,
-		// wait for the voiceschanged event before speaking.
-		if (window.speechSynthesis.getVoices().length > 0) {
-			doSpeak();
-		} else {
-			window.speechSynthesis.addEventListener(
-				"voiceschanged",
-				() => doSpeak(),
-				{ once: true },
-			);
-			// Trigger voice loading
-			window.speechSynthesis.getVoices();
-		}
+		const utterance = new SpeechSynthesisUtterance(text);
+		utterance.rate = 0.9;
+		utterance.onend = () => { isSpeaking = false; };
+		utterance.onerror = () => { isSpeaking = false; };
+		window.speechSynthesis.speak(utterance);
 	}
 
 	onMount(() => {
