@@ -164,11 +164,11 @@ async def reset_session(payload: ResetRequest) -> dict:
 async def text_to_speech(text: str = Query(..., description="Text to speak")):
     """Generates speech audio using Google TTS API"""
     try:
+        from fastapi.responses import Response
         tts = gTTS(text=text, lang="en", tld="com")
         fp = io.BytesIO()
         tts.write_to_fp(fp)
-        fp.seek(0)
-        return StreamingResponse(fp, media_type="audio/mpeg")
+        return Response(content=fp.getvalue(), media_type="audio/mpeg")
     except Exception as exc:
         raise HTTPException(status_code=500, detail="TTS generation failed") from exc
 

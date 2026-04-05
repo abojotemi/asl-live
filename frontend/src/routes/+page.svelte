@@ -129,6 +129,20 @@
 						confidence = data.confidence;
 						framesCollected = data.frames_collected;
 						errorMessage = "";
+
+						if (
+							prediction !== "idle" &&
+							prediction !== "collecting" &&
+							prediction !== "uncertain" &&
+							prediction !== "unknown"
+						) {
+							if (prediction !== lastSpoken && !isSpeaking) {
+								lastSpoken = prediction;
+								void speakPrediction(prediction);
+							}
+						} else if (prediction === "uncertain" || prediction === "idle" || prediction === "collecting") {
+							lastSpoken = "";
+						}
 					}
 				} catch (error: any) {
 					if (error.name !== "AbortError") {
@@ -191,6 +205,7 @@
 		prediction = "idle";
 		confidence = 0;
 		framesCollected = 0;
+		lastSpoken = "";
 	}
 
 	async function resetSession() {
@@ -199,6 +214,7 @@
 		prediction = "idle";
 		confidence = 0;
 		framesCollected = 0;
+		lastSpoken = "";
 
 		try {
 			await fetch(`${API_BASE}/reset`, {
@@ -212,6 +228,7 @@
 	}
 
 	let currentAudio: HTMLAudioElement | null = null;
+	let lastSpoken = "";
 
 	async function speakPrediction(text: string) {
 		if (currentAudio) {
@@ -221,9 +238,20 @@
 
 		isSpeaking = true;
 		try {
-			currentAudio = new Audio(`${API_BASE}/tts?text=${encodeURIComponent(text)}`);
-			currentAudio.onended = () => { isSpeaking = false; };
-			currentAudio.onerror = () => { isSpeaking = false; };
+			const res = await fetch(`${API_BASE}/tts?text=${encodeURIComponent(text)}`);
+			if (!res.ok) throw new Error(`TTS API failed: ${res.status}`);
+			const blob = await res.blob();
+			const audioUrl = URL.createObjectURL(blob);
+			
+			currentAudio = new Audio(audioUrl);
+			currentAudio.onended = () => { 
+				isSpeaking = false; 
+				URL.revokeObjectURL(audioUrl);
+			};
+			currentAudio.onerror = () => { 
+				isSpeaking = false; 
+				URL.revokeObjectURL(audioUrl);
+			};
 			await currentAudio.play();
 		} catch (error) {
 			console.error("Failed to play audio:", error);
