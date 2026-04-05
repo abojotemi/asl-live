@@ -211,32 +211,25 @@
 		}
 	}
 
-	// function speakPrediction(text: string) {
-	// 	window.speechSynthesis.cancel();
-	// 	isSpeaking = true;
+	let currentAudio: HTMLAudioElement | null = null;
 
-	// 	const utterance = new SpeechSynthesisUtterance(text);
-	// 	utterance.rate = 0.9;
-	// 	utterance.onend = () => {
-	// 		isSpeaking = false;
-	// 	};
-	// 	utterance.onerror = () => {
-	// 		isSpeaking = false;
-	// 	};
-	// 	window.speechSynthesis.speak(utterance);
-	// }
-	function speakPrediction(text: string) {
-    window.speechSynthesis.cancel();
-    isSpeaking = true;
+	async function speakPrediction(text: string) {
+		if (currentAudio) {
+			currentAudio.pause();
+			currentAudio.currentTime = 0;
+		}
 
-    setTimeout(() => {
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.rate = 0.9;
-        utterance.onend = () => { isSpeaking = false; };
-        utterance.onerror = () => { isSpeaking = false; };
-        window.speechSynthesis.speak(utterance);
-    }, 100);
-}
+		isSpeaking = true;
+		try {
+			currentAudio = new Audio(`${API_BASE}/tts?text=${encodeURIComponent(text)}`);
+			currentAudio.onended = () => { isSpeaking = false; };
+			currentAudio.onerror = () => { isSpeaking = false; };
+			await currentAudio.play();
+		} catch (error) {
+			console.error("Failed to play audio:", error);
+			isSpeaking = false;
+		}
+	}
 
 	onMount(() => {
 		void checkBackendHealth();
