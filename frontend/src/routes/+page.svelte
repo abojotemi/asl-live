@@ -28,10 +28,10 @@
 	let prediction = $state("idle");
 	let confidence = $state(0);
 	let framesCollected = $state(0);
+	let isProcessing = $state(false);
 
 	// Timers & Controllers
 	let healthTimer: ReturnType<typeof setInterval> | null = null;
-	let captureLoopTimer: ReturnType<typeof setTimeout> | null = null;
 	let abortController: AbortController | null = null;
 
 	const confidencePct = $derived(`${(confidence * 100).toFixed(0)}%`);
@@ -94,13 +94,12 @@
 
 	let isSpeaking = false;
 
-	async function captureFrameIteration() {
+	async function captureAndPredict() {
 		if (!started) {
-			isCapturing = false;
 			return;
 		}
 
-		isCapturing = true;
+		isProcessing = true;
 
 		// Skip inference while audio is playing to avoid interfering with playback
 		if (!isSpeaking) {
@@ -152,12 +151,7 @@
 			}
 		}
 
-		// Loop at a calmer pace to avoid overwhelming the browser and server
-		if (started) {
-			captureLoopTimer = setTimeout(captureFrameIteration, 200);
-		} else {
-			isCapturing = false;
-		}
+		isProcessing = false;
 	}
 
 	async function startCamera() {
@@ -174,7 +168,6 @@
 				videoEl.srcObject = stream;
 				await videoEl.play();
 			}
-			captureFrameIteration(); // Start the loop
 		} catch (error) {
 			stream = null;
 			errorMessage = `Camera access denied or failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -182,10 +175,6 @@
 	}
 
 	function stopCamera() {
-		if (captureLoopTimer) {
-			clearTimeout(captureLoopTimer);
-			captureLoopTimer = null;
-		}
 		if (abortController) {
 			abortController.abort();
 			abortController = null;
@@ -407,23 +396,6 @@
 
 				<!-- Hidden Extraction Canvas -->
 				<canvas bind:this={canvasEl} class="hidden"></canvas>
-
-				<!-- Recording Indicator -->
-				{#if started && isCapturing}
-					<div
-						class="absolute top-4 right-4 z-30 flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/50 backdrop-blur-md border border-white/10"
-						in:fade={{ duration: 150 }}
-						out:fade
-					>
-						<div
-							class="w-2 h-2 rounded-full bg-red-500 animate-[pulse_1s_ease-in-out_infinite]"
-						></div>
-						<span
-							class="text-xs font-bold tracking-wider text-red-500 uppercase"
-							>Live</span
-						>
-					</div>
-				{/if}
 			</div>
 
 			<!-- Error Alert Drawer -->
@@ -694,6 +666,32 @@
 							/></svg
 						>
 						Terminate Scanner
+					</button>
+
+					<button
+						onclick={captureAndPredict}
+						disabled={isProcessing}
+						class="w-full relative py-4 px-6 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 disabled:from-slate-700 disabled:to-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-bold rounded-2xl shadow-lg shadow-emerald-500/25 transition-all duration-300 active:scale-[0.98] group overflow-hidden flex items-center justify-center gap-2"
+					>
+						<!-- Button inner highlight -->
+						<div
+							class="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/30 to-transparent"
+						></div>
+						<span class="relative flex items-center justify-center gap-2">
+							<svg
+								class="w-5 h-5"
+								fill="none"
+								stroke="currentColor"
+								viewBox="0 0 24 24"
+								><path
+									stroke-linecap="round"
+									stroke-linejoin="round"
+									stroke-width="2"
+									d="M14.828 14.828a4 4 0 01-5.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+								/></svg
+							>
+							{isProcessing ? "Processing..." : "Capture & Predict"}
+						</span>
 					</button>
 				{/if}
 
