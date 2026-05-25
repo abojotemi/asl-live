@@ -24,7 +24,9 @@ MAX_FRAMES = 40
 CONFIDENCE_THRESHOLD = 0.40
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "model" / "asl_word_light.tflite"
+# Use the alphabet model by default (A-Z). Replace with word model path if needed.
+MODEL_PATH = BASE_DIR / "model" / "asl_alphabet_light.tflite"
+# Label map file (numeric->label). Keep at repo root for easy editing.
 LABEL_MAP_PATH = BASE_DIR / "label_map.json"
 
 
