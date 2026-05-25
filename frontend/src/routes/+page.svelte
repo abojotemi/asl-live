@@ -23,6 +23,10 @@
 		"connecting",
 	);
 
+	// Backend-provided info
+	let classes = $state<string[]>([]);
+	let maxFrames = $state(40);
+
 	// Inference State
 	let sessionId = $state(crypto.randomUUID());
 	let prediction = $state("idle");
@@ -45,7 +49,11 @@
 				cache: "no-store",
 			});
 			if (res.ok) {
+				const info = await res.json();
 				backendStatus = "connected";
+				// load classes and max_frames from backend health for dynamic UI
+				if (Array.isArray(info.classes)) classes = info.classes;
+				if (typeof info.max_frames === "number") maxFrames = info.max_frames;
 				// Make sure we clear any leftover connecting error if it was just cold starting
 				if (
 					errorMessage.includes("Backend") ||
@@ -227,6 +235,10 @@
 
 		isSpeaking = true;
 		try {
+				// If the model returns a single-letter label, speak it as "Letter X" for clarity
+				if (typeof text === "string" && text.length === 1 && /[A-Z]/i.test(text)) {
+					text = `Letter ${text.toUpperCase()}`;
+				}
 			const res = await fetch(`${API_BASE}/tts?text=${encodeURIComponent(text)}`);
 			if (!res.ok) throw new Error(`TTS API failed: ${res.status}`);
 			const blob = await res.blob();
@@ -296,7 +308,7 @@
 					ASL Pulse
 				</h1>
 				<p class="text-sm font-medium text-slate-400">
-					Live Prediction of 5 Core ASL Words
+					Live Prediction for the ASL Alphabet (A–Z)
 				</p>
 			</div>
 		</div>
@@ -539,6 +551,21 @@
 										/>
 									</svg>
 								</button>
+								{#if classes && classes.length > 0}
+									<div class="grid grid-cols-6 gap-1 mt-4 w-full">
+										{#each classes as c}
+											<div
+												class="text-sm font-bold rounded-md py-2 flex items-center justify-center"
+												class:bg-indigo-500={c === prediction}
+												class:text-white={c === prediction}
+												class:bg-slate-800/40={c !== prediction}
+												class:text-slate-400={c !== prediction}
+											>
+											{c}
+											</div>
+										{/each}
+									</div>
+								{/if}
 							</div>
 						{/if}
 					</div>
@@ -587,7 +614,7 @@
 							>
 							<span
 								class="text-sm font-bold text-slate-500 mb-0.5"
-								>/ 40</span
+								>/ {maxFrames}</span
 							>
 						</div>
 
@@ -597,7 +624,7 @@
 						>
 							<div
 								class="h-full bg-indigo-500 transition-all duration-300 ease-out"
-								style="width: {(framesCollected / 40) * 100}%"
+								style="width: {(framesCollected / maxFrames) * 100}%"
 							></div>
 						</div>
 					</div>
