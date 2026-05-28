@@ -1,42 +1,28 @@
-# sv
+# ASL Prism Frontend
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+This Svelte app is a polished dashboard for the ASL alphabet landmark model.
 
-## Creating a project
+## What it does
 
-If you're seeing this, you've probably already done this step. Congrats!
+- streams camera frames to the backend for live one-frame inference
+- supports still-image uploads for quick testing
+- shows confidence, top candidates, and recent prediction history
+- can optionally speak predictions through the backend TTS endpoint
 
-```sh
-# create a new project
-npx sv create my-app
-```
-
-To recreate this project with the same configuration:
+## Develop
 
 ```sh
-# recreate this project
-npx sv@0.12.8 create --template minimal --types ts --add tailwindcss="plugins:typography,forms" --install npm .
-```
-
-## Developing
-
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
-
-```sh
+npm install
 npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
 ```
 
-## Building
-
-To create a production version of your app:
+## Build
 
 ```sh
 npm run build
 ```
 
-You can preview the production build with `npm run preview`.
+## Notes
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+- Set `VITE_API_BASE_URL` if the backend is not running on `http://localhost:8000`
+- The UI expects the backend to expose `/health`, `/predict`, `/reset`, and `/tts`

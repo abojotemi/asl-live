@@ -1,52 +1,49 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import threading
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, List
-from uuid import uuid4
+from typing import List
 
 import cv2
-import io
 import mediapipe as mp
 import numpy as np
 import tensorflow as tf
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from gtts import gTTS
 from pydantic import BaseModel, Field
 
-MAX_FRAMES = 40
-CONFIDENCE_THRESHOLD = 0.40
-
 BASE_DIR = Path(__file__).resolve().parent
-# Use the alphabet model by default (A-Z). Replace with word model path if needed.
-MODEL_PATH = BASE_DIR / "model" / "asl_alphabet_light.tflite"
-# Label map file (numeric->label). Keep at repo root for easy editing.
+MODEL_PATH = BASE_DIR / "model" / "asl_alphabet_mlp.tflite"
 LABEL_MAP_PATH = BASE_DIR / "label_map.json"
+
+FEATURE_DIM = 126
+MIN_DETECTION_CONFIDENCE = 0.5
+CONFIDENCE_THRESHOLD = 0.40
 
 
 class PredictRequest(BaseModel):
     image_base64: str = Field(
         ..., description="JPEG/PNG image in base64, no data URL header"
     )
-    session_id: str | None = Field(default=None, description="Client session id")
+
+
+class PredictionCandidate(BaseModel):
+    label: str
+    confidence: float
 
 
 class PredictResponse(BaseModel):
-    session_id: str
     prediction: str
     confidence: float
-    ready: bool
-    frames_collected: int
-
-
-class ResetRequest(BaseModel):
-    session_id: str
+    hand_detected: bool
+    detected_hands: int
+    top_candidates: list[PredictionCandidate] = Field(default_factory=list)
 
 
 def load_label_map(path: Path) -> List[str]:
@@ -54,13 +51,14 @@ def load_label_map(path: Path) -> List[str]:
         raise FileNotFoundError(f"Label map not found: {path}")
 
     raw = json.loads(path.read_text())
-    pairs = sorted(((int(k), v) for k, v in raw.items()), key=lambda x: x[0])
-    return [v for _, v in pairs]
+    pairs = sorted(((int(k), v) for k, v in raw.items()), key=lambda item: item[0])
+    return [label for _, label in pairs]
 
 
 def decode_image(base64_str: str) -> np.ndarray:
+    cleaned = base64_str.split(",", 1)[-1]
     try:
-        image_bytes = base64.b64decode(base64_str)
+        image_bytes = base64.b64decode(cleaned)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid base64 image") from exc
 
@@ -77,14 +75,16 @@ def empty_hand() -> np.ndarray:
 
 def extract_hand_vector_from_frame(
     frame_bgr: np.ndarray, hands_model: mp.solutions.hands.Hands
-) -> np.ndarray:
+) -> tuple[np.ndarray, bool, int]:
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     result = hands_model.process(frame_rgb)
 
     left = empty_hand()
     right = empty_hand()
+    detected_hands = 0
 
     if result.multi_hand_landmarks and result.multi_handedness:
+        detected_hands = len(result.multi_hand_landmarks)
         for hand_lm, handedness in zip(
             result.multi_hand_landmarks, result.multi_handedness
         ):
@@ -97,7 +97,8 @@ def extract_hand_vector_from_frame(
             else:
                 right = pts
 
-    return np.concatenate([left.reshape(-1), right.reshape(-1)], axis=0)
+    feature = np.concatenate([left.reshape(-1), right.reshape(-1)], axis=0)
+    return feature, detected_hands > 0, detected_hands
 
 
 if not MODEL_PATH.exists():
@@ -109,28 +110,25 @@ interpreter = tf.lite.Interpreter(model_path=str(MODEL_PATH))
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
+input_dtype = input_details[0]["dtype"]
 
 mp_hands = mp.solutions.hands
 hands_model = mp_hands.Hands(
-    static_image_mode=False,
+    static_image_mode=True,
     max_num_hands=2,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
+    min_detection_confidence=MIN_DETECTION_CONFIDENCE,
 )
 
-session_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_FRAMES))
 inference_lock = threading.Lock()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: nothing extra needed
     yield
-    # Shutdown: release MediaPipe resources
     hands_model.close()
 
 
-app = FastAPI(title="ASL Live Inference API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="ASL Alphabet MLP API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -152,21 +150,22 @@ async def health() -> dict:
         "status": "ok",
         "classes": CLASS_NAMES,
         "model_path": str(MODEL_PATH),
-        "max_frames": MAX_FRAMES,
+        "feature_dim": FEATURE_DIM,
+        "inference_mode": "single-frame-landmarks",
+        "min_detection_confidence": MIN_DETECTION_CONFIDENCE,
+        "confidence_threshold": CONFIDENCE_THRESHOLD,
     }
 
 
 @app.post("/reset")
-async def reset_session(payload: ResetRequest) -> dict:
-    session_buffers.pop(payload.session_id, None)
-    return {"ok": True}
+async def reset_session() -> dict:
+    return {"ok": True, "message": "Single-frame model has no session buffer."}
 
 
 @app.get("/tts")
 async def text_to_speech(text: str = Query(..., description="Text to speak")):
-    """Generates speech audio using Google TTS API"""
+    """Generate speech audio using Google TTS."""
     try:
-        from fastapi.responses import Response
         tts = gTTS(text=text, lang="en", tld="com")
         fp = io.BytesIO()
         tts.write_to_fp(fp)
@@ -177,42 +176,47 @@ async def text_to_speech(text: str = Query(..., description="Text to speak")):
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(payload: PredictRequest) -> PredictResponse:
-    session_id = payload.session_id or str(uuid4())
-    buffer = session_buffers[session_id]
-
     frame = decode_image(payload.image_base64)
     frame = cv2.resize(frame, (320, 240))
-    with inference_lock:
-        feature = extract_hand_vector_from_frame(frame, hands_model)
-    buffer.append(feature)
 
-    frames_collected = len(buffer)
-    if frames_collected < MAX_FRAMES:
-        return PredictResponse(
-            session_id=session_id,
-            prediction="collecting",
-            confidence=0.0,
-            ready=False,
-            frames_collected=frames_collected,
+    with inference_lock:
+        feature, hand_detected, detected_hands = extract_hand_vector_from_frame(
+            frame, hands_model
         )
 
-    x = np.array(buffer, dtype=np.float32)[None, ...]
+    if not hand_detected:
+        return PredictResponse(
+            prediction="no_hand",
+            confidence=0.0,
+            hand_detected=False,
+            detected_hands=0,
+            top_candidates=[],
+        )
+
+    x = np.expand_dims(feature.astype(input_dtype, copy=False), axis=0)
+
     with inference_lock:
         interpreter.set_tensor(input_details[0]["index"], x)
         interpreter.invoke()
         probs = interpreter.get_tensor(output_details[0]["index"])[0]
 
-    idx = int(np.argmax(probs))
-    conf = float(probs[idx])
-    pred = CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else "unknown"
+    ranked = np.argsort(probs)[::-1]
+    top_candidates = [
+        PredictionCandidate(label=CLASS_NAMES[idx], confidence=float(probs[idx]))
+        for idx in ranked[:3]
+    ]
 
-    if conf < CONFIDENCE_THRESHOLD:
-        pred = "uncertain"
+    best_idx = int(ranked[0])
+    best_conf = float(probs[best_idx])
+    prediction = CLASS_NAMES[best_idx]
+
+    if best_conf < CONFIDENCE_THRESHOLD:
+        prediction = "uncertain"
 
     return PredictResponse(
-        session_id=session_id,
-        prediction=pred,
-        confidence=conf,
-        ready=True,
-        frames_collected=frames_collected,
+        prediction=prediction,
+        confidence=best_conf,
+        hand_detected=True,
+        detected_hands=detected_hands,
+        top_candidates=top_candidates,
     )

@@ -1,12 +1,10 @@
 # ASL Backend (FastAPI)
 
-This backend serves live sign-word inference for:
+This backend now serves the ASL alphabet notebook model:
 
-- `hello`
-- `thankyou`
-- `yes`
-- `no`
-- `sorry`
+- MediaPipe extracts 126 landmark features from each frame
+- the Dense MLP classifies the frame as one of `A`–`Z`
+- inference is instant per frame, not sequence-based
 
 ## Run
 
@@ -21,16 +19,16 @@ Start server:
 
 ## Endpoints
 
-- `GET /health` – sanity check and class list
-- `POST /predict` – accepts base64 frame and session id
-- `POST /reset` – clears a session frame buffer
+- `GET /health` – sanity check, class list, and model metadata
+- `POST /predict` – accepts a base64 frame and returns the top prediction
+- `POST /reset` – kept for compatibility; no session buffer is used now
 
 `/predict` request body:
 
 ```json
 {
 	"image_base64": "...",
-	"session_id": "optional-session-id"
+	"image_base64": "..."
 }
 ```
 
@@ -38,6 +36,9 @@ Start server:
 
 - `prediction`
 - `confidence`
-- `ready` (false until 40 frames are collected)
-- `frames_collected`
+- `hand_detected`
+- `detected_hands`
+- `top_candidates`
+
+The frontend is now designed around this single-frame inference flow, with live camera snapshots and still-image uploads instead of a multi-frame buffer.
 

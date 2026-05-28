@@ -1,45 +1,85 @@
 <script lang="ts">
 	import { onDestroy, onMount } from "svelte";
-	import { fade, slide, scale } from "svelte/transition";
+	import { fade } from "svelte/transition";
 
-	// Constants
+	type BackendHealth = {
+		status: string;
+		classes: string[];
+		model_path: string;
+		feature_dim: number;
+		inference_mode: string;
+		min_detection_confidence: number;
+		confidence_threshold: number;
+	};
+
+	type PredictionCandidate = {
+		label: string;
+		confidence: number;
+	};
+
+	type PredictionResponse = {
+		prediction: string;
+		confidence: number;
+		hand_detected: boolean;
+		detected_hands: number;
+		top_candidates: PredictionCandidate[];
+	};
+
 	const API_BASE =
 		(import.meta.env.VITE_API_BASE_URL as string) ||
-		(typeof window !== "undefined" &&
-		window.location.hostname !== "localhost"
+		(typeof window !== "undefined" && window.location.hostname !== "localhost"
 			? "https://asl-live.onrender.com"
 			: "http://localhost:8000");
 
-	// DOM Refs
+	const CAMERA_WIDTH = 640;
+	const CAMERA_HEIGHT = 480;
+	const DEFAULT_CAPTURE_INTERVAL = 240;
+	const SPEAK_THRESHOLD = 0.76;
+	const TOP_HISTORY_COUNT = 6;
+
 	let videoEl = $state<HTMLVideoElement | null>(null);
 	let canvasEl = $state<HTMLCanvasElement | null>(null);
+	let fileInputEl = $state<HTMLInputElement | null>(null);
 
-	// App State
 	let stream = $state<MediaStream | null>(null);
-	let started = $derived(stream !== null);
-	let isCapturing = $state(false);
-	let errorMessage = $state("");
+	let cameraState = $state<"idle" | "starting" | "live">("idle");
 	let backendStatus = $state<"connecting" | "connected" | "offline">(
 		"connecting",
 	);
-
-	// Backend-provided info
-	let classes = $state<string[]>([]);
-	let maxFrames = $state(40);
-
-	// Inference State
-	let sessionId = $state(crypto.randomUUID());
-	let prediction = $state("idle");
-	let confidence = $state(0);
-	let framesCollected = $state(0);
+	let errorMessage = $state("");
 	let isProcessing = $state(false);
+	let liveInferenceEnabled = $state(true);
+	let captureIntervalMs = $state(DEFAULT_CAPTURE_INTERVAL);
+	let speechEnabled = $state(false);
 
-	// Timers & Controllers
-	let healthTimer: ReturnType<typeof setInterval> | null = null;
+	let prediction = $state("waiting");
+	let confidence = $state(0);
+	let handDetected = $state(false);
+	let detectedHands = $state(0);
+	let topCandidates = $state<PredictionCandidate[]>([]);
+	let lastUpdated = $state("");
+
+	let backendInfo = $state<BackendHealth | null>(null);
+	let classNames = $state<string[]>([]);
+	let uploadedImageUrl = $state<string | null>(null);
+	let uploadedImageName = $state("");
+	let recentPredictions = $state<Array<{ label: string; confidence: number; at: string }>>([]);
+	let statusTimer: ReturnType<typeof setInterval> | null = null;
+	let captureTimer: ReturnType<typeof setInterval> | null = null;
 	let abortController: AbortController | null = null;
+	let currentAudio: HTMLAudioElement | null = null;
+	let lastSpoken = "";
+	let isSpeaking = false;
 
-	const confidencePct = $derived(`${(confidence * 100).toFixed(0)}%`);
-
+	const confidencePct = $derived(`${Math.round(confidence * 100)}%`);
+	const confidenceBar = $derived(`${Math.max(0, Math.min(100, confidence * 100))}%`);
+	const cameraStatusLabel = $derived(
+		cameraState === "live"
+			? "Camera active"
+			: cameraState === "starting"
+				? "Starting camera"
+				: "Camera idle",
+	);
 	async function checkBackendHealth() {
 		try {
 			const res = await fetch(`${API_BASE}/health`, {
@@ -48,28 +88,39 @@
 				signal: AbortSignal.timeout(5000),
 				cache: "no-store",
 			});
-			if (res.ok) {
-				const info = await res.json();
-				backendStatus = "connected";
-				// load classes and max_frames from backend health for dynamic UI
-				if (Array.isArray(info.classes)) classes = info.classes;
-				if (typeof info.max_frames === "number") maxFrames = info.max_frames;
-				// Make sure we clear any leftover connecting error if it was just cold starting
-				if (
-					errorMessage.includes("Backend") ||
-					errorMessage.includes("Warming")
-				) {
-					errorMessage = "";
-				}
-			} else {
+			if (!res.ok) {
 				backendStatus = "offline";
+				return;
 			}
-		} catch (error) {
+
+			backendStatus = "connected";
+			const data = (await res.json()) as BackendHealth;
+			backendInfo = data;
+			classNames = data.classes ?? [];
+			if (errorMessage.includes("backend") || errorMessage.includes("offline")) {
+				errorMessage = "";
+			}
+		} catch {
 			backendStatus = "offline";
-			if (!started && errorMessage === "") {
-				errorMessage =
-					"Warming up backend... Deployments may take a minute to wake up.";
+			if (!stream && !uploadedImageUrl && !errorMessage) {
+				errorMessage = "Backend is offline or still waking up.";
 			}
+		}
+	}
+
+	function clearCaptureTimer() {
+		if (captureTimer) {
+			clearInterval(captureTimer);
+			captureTimer = null;
+		}
+	}
+
+	function updateCaptureTimer() {
+		clearCaptureTimer();
+		if (stream && cameraState === "live" && liveInferenceEnabled) {
+			captureTimer = setInterval(() => {
+				void captureAndPredict();
+			}, captureIntervalMs);
 		}
 	}
 
@@ -79,153 +130,31 @@
 			!canvasEl ||
 			videoEl.videoWidth === 0 ||
 			videoEl.videoHeight === 0
-		)
+		) {
 			return null;
+		}
 
-		// Use a smaller dimension for inference to save bandwidth and compute
-		const TARGET_WIDTH = 320;
-		const TARGET_HEIGHT = 240;
-
-		canvasEl.width = TARGET_WIDTH;
-		canvasEl.height = TARGET_HEIGHT;
-
+		canvasEl.width = CAMERA_WIDTH;
+		canvasEl.height = CAMERA_HEIGHT;
 		const ctx = canvasEl.getContext("2d");
 		if (!ctx) return null;
 
-		// Calculate crop/scale to maintain aspect ratio if needed, or just squash
-		// The backend resizes independently too, but we squash locally for speed
-		ctx.drawImage(videoEl, 0, 0, TARGET_WIDTH, TARGET_HEIGHT);
-
-		const dataUrl = canvasEl.toDataURL("image/jpeg", 0.6);
-		return dataUrl.split(",")[1] ?? null; // Strip the `data:image/jpeg;base64,` header
+		ctx.drawImage(videoEl, 0, 0, CAMERA_WIDTH, CAMERA_HEIGHT);
+		const dataUrl = canvasEl.toDataURL("image/jpeg", 0.8);
+		return dataUrl.split(",")[1] ?? null;
 	}
 
-	let isSpeaking = false;
-
-	async function captureAndPredict() {
-		if (!started) {
-			return;
-		}
-
-		isProcessing = true;
-
-		// Skip inference while audio is playing to avoid interfering with playback
-		if (!isSpeaking) {
-			const imageBase64 = captureBase64();
-
-			if (imageBase64) {
-				try {
-					if (abortController) abortController.abort();
-					abortController = new AbortController();
-
-					const payload = {
-						image_base64: imageBase64,
-						session_id: sessionId,
-					};
-					const response = await fetch(`${API_BASE}/predict`, {
-						method: "POST",
-						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify(payload),
-						signal: abortController.signal,
-					});
-
-					if (response.ok) {
-						const data = await response.json();
-						sessionId = data.session_id;
-						prediction = data.prediction;
-						confidence = data.confidence;
-						framesCollected = data.frames_collected;
-						errorMessage = "";
-
-						if (
-							prediction !== "idle" &&
-							prediction !== "collecting" &&
-							prediction !== "uncertain" &&
-							prediction !== "unknown"
-						) {
-							if (prediction !== lastSpoken && !isSpeaking) {
-								lastSpoken = prediction;
-								void speakPrediction(prediction);
-							}
-						} else if (prediction === "uncertain" || prediction === "idle" || prediction === "collecting") {
-							lastSpoken = "";
-						}
-					}
-				} catch (error: any) {
-					if (error.name !== "AbortError") {
-						console.error("Inference error:", error);
-					}
-				}
-			}
-		}
-
-		isProcessing = false;
+	function captureUploadedBase64(): string | null {
+		if (!uploadedImageUrl) return null;
+		return uploadedImageUrl.split(",")[1] ?? null;
 	}
 
-	async function startCamera() {
-		errorMessage = "";
-		try {
-			stream = await navigator.mediaDevices.getUserMedia({
-				video: {
-					width: { ideal: 640 },
-					height: { ideal: 480 },
-					facingMode: "user",
-				},
-			});
-			if (videoEl) {
-				videoEl.srcObject = stream;
-				await videoEl.play();
-			}
-		} catch (error) {
-			stream = null;
-			errorMessage = `Camera access denied or failed: ${error instanceof Error ? error.message : String(error)}`;
-		}
+	function pushRecentPrediction(label: string, value: number) {
+		recentPredictions = [
+			{ label, confidence: value, at: new Date().toLocaleTimeString() },
+			...recentPredictions,
+		].slice(0, TOP_HISTORY_COUNT);
 	}
-
-	function stopCamera() {
-		if (abortController) {
-			abortController.abort();
-			abortController = null;
-		}
-		if (stream) {
-			for (const track of stream.getTracks()) {
-				track.stop();
-			}
-		}
-		if (videoEl) {
-			videoEl.srcObject = null;
-		}
-		stream = null;
-		isCapturing = false;
-
-		// Reset states upon stopping
-		prediction = "idle";
-		confidence = 0;
-		framesCollected = 0;
-		lastSpoken = "";
-	}
-
-	async function resetSession() {
-		const oldSession = sessionId;
-		sessionId = crypto.randomUUID(); // Cycle the session ID immediately
-		prediction = "idle";
-		confidence = 0;
-		framesCollected = 0;
-		lastSpoken = "";
-
-		try {
-			await fetch(`${API_BASE}/reset`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ session_id: oldSession }),
-			});
-		} catch {
-			// Best-effort
-		}
-	}
-
-	let currentAudio: HTMLAudioElement | null = null;
-	let lastSpoken = "";
 
 	async function speakPrediction(text: string) {
 		if (currentAudio) {
@@ -235,519 +164,495 @@
 
 		isSpeaking = true;
 		try {
-				// If the model returns a single-letter label, speak it as "Letter X" for clarity
-				if (typeof text === "string" && text.length === 1 && /[A-Z]/i.test(text)) {
-					text = `Letter ${text.toUpperCase()}`;
-				}
 			const res = await fetch(`${API_BASE}/tts?text=${encodeURIComponent(text)}`);
-			if (!res.ok) throw new Error(`TTS API failed: ${res.status}`);
+			if (!res.ok) throw new Error(`TTS failed with ${res.status}`);
 			const blob = await res.blob();
 			const audioUrl = URL.createObjectURL(blob);
-			
 			currentAudio = new Audio(audioUrl);
-			currentAudio.onended = () => { 
-				isSpeaking = false; 
+			currentAudio.onended = () => {
+				isSpeaking = false;
 				URL.revokeObjectURL(audioUrl);
 			};
-			currentAudio.onerror = () => { 
-				isSpeaking = false; 
+			currentAudio.onerror = () => {
+				isSpeaking = false;
 				URL.revokeObjectURL(audioUrl);
 			};
 			await currentAudio.play();
 		} catch (error) {
-			console.error("Failed to play audio:", error);
+			console.error("TTS error:", error);
 			isSpeaking = false;
 		}
 	}
 
+	async function predictFromBase64(imageBase64: string) {
+		if (!imageBase64 || isProcessing || backendStatus === "offline") return;
+
+		isProcessing = true;
+		errorMessage = "";
+		try {
+			abortController?.abort();
+			abortController = new AbortController();
+
+			const response = await fetch(`${API_BASE}/predict`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ image_base64: imageBase64 }),
+				signal: abortController.signal,
+			});
+
+			if (!response.ok) {
+				throw new Error(`Predict failed with ${response.status}`);
+			}
+
+			const data = (await response.json()) as PredictionResponse;
+			prediction = data.prediction;
+			confidence = data.confidence;
+			handDetected = data.hand_detected;
+			detectedHands = data.detected_hands;
+			topCandidates = data.top_candidates ?? [];
+			lastUpdated = new Date().toLocaleTimeString();
+
+			if (data.prediction !== "no_hand" && data.prediction !== "uncertain") {
+				pushRecentPrediction(data.prediction, data.confidence);
+				if (
+					speechEnabled &&
+					data.confidence >= SPEAK_THRESHOLD &&
+					data.prediction !== lastSpoken &&
+					!isSpeaking
+				) {
+					lastSpoken = data.prediction;
+					void speakPrediction(data.prediction);
+				}
+			}
+
+			if (data.prediction === "no_hand") {
+				errorMessage = "No hand landmarks were detected. Try moving closer to the camera.";
+			}
+		} catch (error) {
+			if ((error as { name?: string }).name !== "AbortError") {
+				console.error("Inference error:", error);
+				errorMessage = "Inference failed. Check the backend and camera permissions.";
+			}
+		} finally {
+			isProcessing = false;
+		}
+	}
+
+	async function captureAndPredict() {
+		if (cameraState !== "live") return;
+		const imageBase64 = captureBase64();
+		if (imageBase64) {
+			await predictFromBase64(imageBase64);
+		}
+	}
+
+	async function analyzeUploadedImage() {
+		const imageBase64 = captureUploadedBase64();
+		if (!imageBase64) {
+			errorMessage = "Upload a photo first, then try again.";
+			return;
+		}
+		await predictFromBase64(imageBase64);
+	}
+
+	async function readFileAsDataUrl(file: File) {
+		return await new Promise<string>((resolve, reject) => {
+			const reader = new FileReader();
+			reader.onload = () => resolve(String(reader.result));
+			reader.onerror = () => reject(reader.error);
+			reader.readAsDataURL(file);
+		});
+	}
+
+	async function onUploadImage(event: Event) {
+		const input = event.currentTarget as HTMLInputElement | null;
+		const file = input?.files?.[0];
+		if (!file) return;
+
+		if (!file.type.startsWith("image/")) {
+			errorMessage = "Please upload an image file.";
+			return;
+		}
+
+		try {
+			uploadedImageUrl = await readFileAsDataUrl(file);
+			uploadedImageName = file.name;
+			errorMessage = "";
+		} catch {
+			errorMessage = "Could not read the uploaded file.";
+		}
+	}
+
+	async function startCamera() {
+		errorMessage = "";
+		cameraState = "starting";
+		try {
+			stream = await navigator.mediaDevices.getUserMedia({
+				video: {
+					width: { ideal: CAMERA_WIDTH },
+					height: { ideal: CAMERA_HEIGHT },
+					facingMode: "user",
+				},
+				audio: false,
+			});
+
+			if (videoEl) {
+				videoEl.srcObject = stream;
+				await videoEl.play();
+			}
+
+			cameraState = "live";
+			updateCaptureTimer();
+			lastSpoken = "";
+		} catch (error) {
+			cameraState = "idle";
+			stream = null;
+			errorMessage = `Camera access failed: ${error instanceof Error ? error.message : String(error)}`;
+		}
+	}
+
+	function stopCamera() {
+		abortController?.abort();
+		abortController = null;
+		clearCaptureTimer();
+
+		if (stream) {
+			for (const track of stream.getTracks()) {
+				track.stop();
+			}
+		}
+
+		if (videoEl) {
+			videoEl.srcObject = null;
+		}
+
+		stream = null;
+		cameraState = "idle";
+		prediction = "waiting";
+		confidence = 0;
+		handDetected = false;
+		detectedHands = 0;
+		topCandidates = [];
+		lastSpoken = "";
+	}
+
+	async function resetView() {
+		stopCamera();
+		uploadedImageUrl = null;
+		uploadedImageName = "";
+		recentPredictions = [];
+		lastUpdated = "";
+		errorMessage = "";
+		await checkBackendHealth();
+	}
+
+	function syncControls() {
+		updateCaptureTimer();
+	}
+
 	onMount(() => {
 		void checkBackendHealth();
-		healthTimer = setInterval(() => void checkBackendHealth(), 10000);
+		statusTimer = setInterval(() => void checkBackendHealth(), 10000);
 	});
 
 	onDestroy(() => {
-		if (healthTimer) clearInterval(healthTimer);
+		if (statusTimer) clearInterval(statusTimer);
+		clearCaptureTimer();
 		stopCamera();
+		currentAudio?.pause();
 	});
 </script>
 
 <svelte:head>
-	<title>ASL Pulse • Live Sign Language Predictor</title>
+	<title>ASL Prism • Landmark MLP Inference</title>
+	<meta
+		name="description"
+		content="A polished ASL alphabet app powered by a single-frame MediaPipe landmark MLP."
+	/>
 </svelte:head>
 
-<div
-	class="min-h-screen bg-slate-950 bg-[radial-gradient(ellipse_80%_80%_at_50%_-20%,rgba(120,119,198,0.3),rgba(255,255,255,0))] text-slate-200 font-sans p-4 sm:p-8 flex flex-col items-center justify-center selection:bg-indigo-500/30"
->
-	<!-- Header -->
-	<header
-		class="w-full max-w-4xl flex flex-col sm:flex-row items-center justify-between mb-8 gap-6 z-10"
-		in:slide={{ duration: 700, delay: 100 }}
-	>
-		<div class="flex items-center gap-4">
-			<div
-				class="w-12 h-12 rounded-2xl bg-gradient-to-tr from-indigo-500 to-violet-500 flex items-center justify-center shadow-lg shadow-indigo-500/20"
-			>
-				<svg
-					class="w-6 h-6 text-white"
-					fill="none"
-					stroke="currentColor"
-					viewBox="0 0 24 24"
-				>
-					<path
-						stroke-linecap="round"
-						stroke-linejoin="round"
-						stroke-width="2"
-						d="M7 11.5V14m0-2.5v-6a1.5 1.5 0 113 0m-3 6a1.5 1.5 0 00-3 0v2a7.5 7.5 0 0015 0v-5a1.5 1.5 0 00-3 0m-6-3V11m0-5.5v-1a1.5 1.5 0 013 0v1m0 0V11m0-5.5a1.5 1.5 0 013 0v3m0 0V11"
-					/>
-				</svg>
-			</div>
-			<div>
-				<h1
-					class="text-3xl font-extrabold tracking-tight text-white mb-1"
-				>
-					ASL Pulse
-				</h1>
-				<p class="text-sm font-medium text-slate-400">
-					Live Prediction for the ASL Alphabet (A–Z)
-				</p>
-			</div>
-		</div>
+<div class="min-h-screen overflow-hidden bg-slate-950 text-slate-100">
+	<div class="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(99,102,241,0.20),transparent_32%),radial-gradient(circle_at_right,rgba(16,185,129,0.10),transparent_20%),linear-gradient(180deg,#020617_0%,#0f172a_100%)]"></div>
+	<div class="absolute inset-0 opacity-40 bg-[linear-gradient(rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[size:52px_52px]"></div>
 
-		<!-- Backend Status Pill -->
-		<div
-			class="flex items-center gap-3 px-4 py-2.5 rounded-full bg-slate-900/50 border border-slate-700/50 backdrop-blur-md transition-colors duration-300 relative overflow-hidden group"
-		>
-			<!-- Animated glow effect depending on status -->
-			{#if backendStatus === "connected"}
-				<div
-					class="absolute inset-0 bg-emerald-500/10 opacity-0 group-hover:opacity-100 transition-opacity"
-				></div>
-				<div
-					class="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)] flex-shrink-0 animate-pulse"
-				></div>
-				<span class="text-sm font-bold text-emerald-400"
-					>Systems Normal</span
-				>
-			{:else if backendStatus === "connecting"}
-				<div
-					class="absolute inset-0 bg-amber-500/10 opacity-0 group-hover:opacity-100 transition-opacity"
-				></div>
-				<div
-					class="w-2.5 h-2.5 rounded-full bg-amber-500 animate-bounce flex-shrink-0"
-				></div>
-				<span class="text-sm font-bold text-amber-500"
-					>Connecting...</span
-				>
-			{:else}
-				<div
-					class="absolute inset-0 bg-rose-500/10 opacity-0 group-hover:opacity-100 transition-opacity"
-				></div>
-				<div
-					class="w-2.5 h-2.5 rounded-full bg-rose-500 flex-shrink-0"
-				></div>
-				<span class="text-sm font-bold text-rose-500"
-					>Backend Offline</span
-				>
-			{/if}
-		</div>
-	</header>
-
-	<!-- Main Interface Container -->
-	<main
-		class="w-full max-w-4xl grid grid-cols-1 lg:grid-cols-12 gap-6 relative z-10"
-		in:scale={{ start: 0.95, duration: 600, delay: 200 }}
-	>
-		<!-- Visuals Column -->
-		<div class="lg:col-span-8 flex flex-col gap-6">
-			<!-- Video Feed Card -->
-			<div
-				class="relative w-full aspect-video rounded-3xl overflow-hidden bg-slate-900 border border-slate-700/50 shadow-2xl flex flex-col items-center justify-center group"
-			>
-				{#if !started}
-					<div
-						class="absolute inset-0 flex flex-col items-center justify-center p-6 text-center z-20 pointer-events-none"
-						in:fade={{ duration: 200 }}
-					>
-						<div
-							class="w-20 h-20 rounded-full bg-slate-800/80 flex items-center justify-center mb-4 border border-slate-700 shadow-xl group-hover:scale-110 transition-transform duration-500"
-						>
-							<svg
-								class="w-8 h-8 text-slate-400"
-								fill="none"
-								stroke="currentColor"
-								viewBox="0 0 24 24"
-							>
-								<path
-									stroke-linecap="round"
-									stroke-linejoin="round"
-									stroke-width="1.5"
-									d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"
-								/>
-							</svg>
-						</div>
-						<p class="text-lg font-semibold text-slate-300">
-							Camera Inactive
-						</p>
-						<p class="text-sm text-slate-500 mt-1 max-w-xs">
-							Start the camera to begin analyzing sign language
-							gestures.
-						</p>
-					</div>
-				{/if}
-
-				<!-- Actual Video Feed -->
-				<!-- svelte-ignore a11y_media_has_caption -->
-				<video
-					bind:this={videoEl}
-					playsinline
-					muted
-					class="w-full h-full object-cover z-10 mirror-video transition-opacity duration-700 {started
-						? 'opacity-100'
-						: 'opacity-0'}"
-				></video>
-
-				<!-- Hidden Extraction Canvas -->
-				<canvas bind:this={canvasEl} class="hidden"></canvas>
-			</div>
-
-			<!-- Error Alert Drawer -->
-			{#if errorMessage}
-				<div
-					class="bg-rose-500/10 border border-rose-500/20 rounded-2xl p-4 flex items-start gap-4"
-					in:slide={{ duration: 300 }}
-					out:slide
-				>
-					<svg
-						class="w-6 h-6 text-rose-500 flex-shrink-0 mt-0.5"
-						fill="none"
-						viewBox="0 0 24 24"
-						stroke="currentColor"
-					>
-						<path
-							stroke-linecap="round"
-							stroke-linejoin="round"
-							stroke-width="2"
-							d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
-						/>
+	<div class="relative z-10 mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-8 px-4 py-6 sm:px-6 lg:px-8">
+		<header class="flex flex-col gap-4 rounded-3xl border border-white/10 bg-white/5 p-5 shadow-2xl shadow-slate-950/40 backdrop-blur-xl md:flex-row md:items-center md:justify-between">
+			<div class="flex items-center gap-4">
+				<div class="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 via-cyan-500 to-emerald-500 shadow-lg shadow-cyan-500/20">
+					<svg class="h-7 w-7 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M7 11.5V14m0-2.5v-6a1.5 1.5 0 113 0m-3 6a1.5 1.5 0 00-3 0v2a7.5 7.5 0 0015 0v-5a1.5 1.5 0 00-3 0m-6-3V11m0-5.5v-1a1.5 1.5 0 013 0v1m0 0V11m0-5.5a1.5 1.5 0 013 0v3m0 0V11" />
 					</svg>
-					<div>
-						<h3 class="text-sm font-bold text-rose-400">Notice</h3>
-						<p class="text-sm text-slate-300 mt-1 leading-relaxed">
-							{errorMessage}
-						</p>
-					</div>
 				</div>
-			{/if}
-		</div>
+				<div>
+					<p class="text-xs font-semibold uppercase tracking-[0.35em] text-cyan-300/80">ASL Prism</p>
+					<h1 class="mt-1 text-3xl font-black tracking-tight text-white sm:text-4xl">Single-frame landmark inference</h1>
+					<p class="mt-2 max-w-2xl text-sm leading-6 text-slate-300">
+						The app now mirrors the notebook model: MediaPipe extracts 126 hand-landmark features and the MLP classifies each frame instantly.
+					</p>
+				</div>
+			</div>
 
-		<!-- Logic & Results Column -->
-		<div class="lg:col-span-4 flex flex-col gap-6">
-			<!-- AI Processing Card -->
-			<div
-				class="bg-slate-900/60 backdrop-blur-md border border-slate-700/50 rounded-3xl p-6 shadow-xl flex-1 flex flex-col relative overflow-hidden"
-			>
-				<!-- Ambient Glow behind card -->
-				<div
-					class="absolute -top-24 -right-24 w-48 h-48 bg-indigo-500/20 blur-3xl rounded-full pointer-events-none"
-				></div>
+			<div class="flex flex-wrap items-center gap-3">
+				<div class="rounded-full border border-white/10 bg-slate-900/70 px-4 py-2 text-sm font-medium text-slate-300">
+					<span class="mr-2 inline-block h-2 w-2 rounded-full {backendStatus === 'connected' ? 'bg-emerald-400' : backendStatus === 'offline' ? 'bg-rose-400' : 'bg-amber-400'}"></span>
+					{backendStatus === "connected" ? "Backend ready" : backendStatus === "offline" ? "Backend offline" : "Connecting..."}
+				</div>
+				<div class="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-300">
+					{backendInfo ? `${backendInfo.inference_mode} • ${backendInfo.feature_dim} dims` : "Landmark model"}
+				</div>
+			</div>
+		</header>
 
-				<h2
-					class="text-sm font-bold tracking-widest text-slate-500 uppercase mb-6 flex items-center gap-2"
-				>
-					<svg
-						class="w-4 h-4"
-						fill="none"
-						stroke="currentColor"
-						viewBox="0 0 24 24"
-						><path
-							stroke-linecap="round"
-							stroke-linejoin="round"
-							stroke-width="2"
-							d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
-						/></svg
-					>
-					Inference Engine
-				</h2>
+		<main class="grid gap-6 xl:grid-cols-[1.35fr_0.85fr]">
+			<section class="space-y-6">
+				<div class="rounded-[2rem] border border-white/10 bg-slate-900/55 p-4 shadow-2xl shadow-slate-950/40 backdrop-blur-xl sm:p-5">
+					<div class="mb-4 flex items-center justify-between gap-3">
+						<div>
+							<h2 class="text-lg font-bold text-white">Live camera</h2>
+							<p class="text-sm text-slate-400">Capture a frame, extract landmarks, and classify instantly.</p>
+						</div>
+						<div class="rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.24em] text-slate-300">
+							{cameraStatusLabel}
+						</div>
+					</div>
 
-				<!-- Prediction Giant Result -->
-				<div
-					class="flex-1 flex flex-col items-center justify-center text-center pb-6 border-b border-slate-700/50"
-				>
-					<!-- Active visual bounding frame for prediction text -->
-					<div
-						class="relative w-full rounded-2xl py-8 overflow-hidden"
-					>
-						<!-- Animated background for certain states -->
-						{#if prediction !== "idle" && prediction !== "collecting"}
-							<div
-								class="absolute inset-0 bg-gradient-to-br from-indigo-500/5 to-purple-500/5"
-								in:fade
-							></div>
-						{/if}
-
-						{#if prediction === "idle"}
-							<span
-								class="text-4xl font-black text-slate-600 tracking-tight"
-								in:scale>Waiting</span
-							>
-						{:else if prediction === "collecting"}
-							<div
-								class="flex flex-col items-center gap-3"
-								in:fade
-							>
-								<div class="flex items-center gap-2">
-									<div
-										class="w-2 h-2 bg-indigo-500 rounded-full animate-bounce"
-										style="animation-delay: 0s"
-									></div>
-									<div
-										class="w-2 h-2 bg-violet-500 rounded-full animate-bounce"
-										style="animation-delay: 0.1s"
-									></div>
-									<div
-										class="w-2 h-2 bg-fuchsia-500 rounded-full animate-bounce"
-										style="animation-delay: 0.2s"
-									></div>
-								</div>
-								<span class="text-lg font-bold text-indigo-400"
-									>Observing Sequence...</span
-								>
-							</div>
-						{:else if prediction === "uncertain"}
-							<span
-								class="text-4xl font-black text-amber-500 tracking-tight"
-								in:scale>Hmm...</span
-							>
-							<p class="text-slate-400 font-medium mt-2 text-sm">
-								Need clearer motion
-							</p>
-						{:else}
-							<div
-								class="flex flex-col items-center gap-4"
-								in:scale={{ start: 0.8, duration: 400 }}
-							>
-								<span
-									class="text-5xl font-black text-white capitalize tracking-tight drop-shadow-md"
-								>
-									{prediction}
-								</span>
-								<button
-									onclick={() => speakPrediction(prediction)}
-									class="flex items-center justify-center w-12 h-12 rounded-full bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 hover:text-indigo-300 border border-indigo-500/20 hover:border-indigo-500/40 transition-all duration-300 active:scale-95 group"
-									aria-label="Play audio pronunciation"
-									title="Play audio"
-								>
-									<svg
-										class="w-6 h-6 group-hover:scale-110 transition-transform"
-										fill="none"
-										stroke="currentColor"
-										viewBox="0 0 24 24"
-									>
-										<path
-											stroke-linecap="round"
-											stroke-linejoin="round"
-											stroke-width="2"
-											d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.5 10.5h4l5-5v13l-5-5h-4v-3z"
-										/>
+					<div class="relative aspect-[4/3] overflow-hidden rounded-[1.75rem] border border-white/10 bg-slate-950/90 shadow-inner shadow-black/30">
+						{#if cameraState !== "live" && !uploadedImageUrl}
+							<div class="absolute inset-0 flex flex-col items-center justify-center px-8 text-center" in:fade>
+								<div class="mb-4 flex h-20 w-20 items-center justify-center rounded-full border border-cyan-400/20 bg-cyan-400/10 text-cyan-300">
+									<svg class="h-9 w-9" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+										<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
 									</svg>
-								</button>
-								{#if classes && classes.length > 0}
-									<div class="grid grid-cols-6 gap-1 mt-4 w-full">
-										{#each classes as c}
-											<div
-												class="text-sm font-bold rounded-md py-2 flex items-center justify-center"
-												class:bg-indigo-500={c === prediction}
-												class:text-white={c === prediction}
-												class:bg-slate-800/40={c !== prediction}
-												class:text-slate-400={c !== prediction}
-											>
-											{c}
-											</div>
-										{/each}
+								</div>
+								<p class="text-2xl font-black text-white">Camera idle</p>
+								<p class="mt-2 max-w-lg text-sm leading-6 text-slate-400">
+									Start the camera for live inference, or upload a still image below to run a one-frame prediction.
+								</p>
+							</div>
+						{/if}
+
+						{#if uploadedImageUrl && cameraState !== "live"}
+							<img src={uploadedImageUrl} alt="Uploaded preview" class="h-full w-full bg-slate-950 object-contain" />
+						{/if}
+
+						<video
+							bind:this={videoEl}
+							playsinline
+							muted
+							class="mirror-video h-full w-full object-cover {cameraState === 'live' ? 'opacity-100' : 'opacity-0'}"
+						></video>
+
+						<div class="pointer-events-none absolute inset-0 border border-cyan-400/15"></div>
+						<div class="pointer-events-none absolute left-4 top-4 rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.25em] text-cyan-200">
+							MLP • 126-dim landmarks
+						</div>
+						{#if handDetected}
+							<div class="pointer-events-none absolute right-4 top-4 rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.25em] text-emerald-200">
+								{detectedHands} hand{detectedHands === 1 ? "" : "s"} detected
+							</div>
+						{/if}
+						<div class="pointer-events-none absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-slate-950 via-slate-950/45 to-transparent"></div>
+					</div>
+
+					<canvas bind:this={canvasEl} class="hidden"></canvas>
+
+					<div class="mt-4 grid gap-3 sm:grid-cols-3">
+						<button
+							onclick={startCamera}
+							disabled={backendStatus === "offline" || cameraState === "starting"}
+							class="rounded-2xl bg-gradient-to-r from-indigo-500 to-cyan-500 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-cyan-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+						>
+							{cameraState === "starting" ? "Opening camera…" : "Start camera"}
+						</button>
+						<button
+							onclick={stopCamera}
+							disabled={cameraState !== "live" && cameraState !== "starting"}
+							class="rounded-2xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm font-bold text-rose-300 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+						>
+							Stop camera
+						</button>
+						<button
+							onclick={() => void (uploadedImageUrl ? analyzeUploadedImage() : captureAndPredict())}
+							disabled={backendStatus === "offline" || isProcessing || (!uploadedImageUrl && cameraState !== "live")}
+							class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-bold text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+						>
+							{isProcessing ? "Analyzing…" : uploadedImageUrl ? "Analyze image" : "Capture now"}
+						</button>
+					</div>
+
+					<div class="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+						<label class="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
+							<span>Live inference</span>
+							<input type="checkbox" bind:checked={liveInferenceEnabled} onchange={syncControls} class="h-4 w-4 rounded border-slate-600 bg-slate-900 text-cyan-500" />
+						</label>
+						<label class="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
+							<span>Voice cues</span>
+							<input type="checkbox" bind:checked={speechEnabled} class="h-4 w-4 rounded border-slate-600 bg-slate-900 text-cyan-500" />
+						</label>
+						<div class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
+							<div class="flex items-center justify-between gap-3">
+								<span>Capture interval</span>
+								<span class="font-semibold text-cyan-200">{captureIntervalMs} ms</span>
+							</div>
+							<input type="range" min="120" max="1000" step="20" bind:value={captureIntervalMs} oninput={syncControls} class="mt-2 w-full accent-cyan-400" />
+						</div>
+						<div class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
+							<div class="flex items-center justify-between gap-3">
+								<span>Threshold</span>
+								<span class="font-semibold text-emerald-200">{backendInfo ? `${Math.round(backendInfo.confidence_threshold * 100)}%` : "40%"}</span>
+							</div>
+							<p class="mt-2 text-xs text-slate-400">The backend keeps low-confidence frames as uncertain.</p>
+						</div>
+					</div>
+				</div>
+
+				<div class="rounded-[2rem] border border-white/10 bg-slate-900/55 p-4 shadow-2xl shadow-slate-950/40 backdrop-blur-xl sm:p-5">
+					<div class="mb-4 flex items-center justify-between gap-3">
+						<div>
+							<h2 class="text-lg font-bold text-white">Upload a still image</h2>
+							<p class="text-sm text-slate-400">Great for testing the notebook-style single-frame pipeline.</p>
+						</div>
+						<div class="flex items-center gap-3">
+							<button onclick={() => fileInputEl?.click()} class="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-semibold text-slate-100 transition hover:bg-white/10">Choose image</button>
+							<input bind:this={fileInputEl} type="file" accept="image/*" class="hidden" onchange={onUploadImage} />
+						</div>
+					</div>
+
+					<div class="grid gap-4 md:grid-cols-[0.9fr_1.1fr]">
+						<div class="rounded-3xl border border-dashed border-white/10 bg-slate-950/40 p-5">
+							<p class="text-sm font-semibold text-slate-300">Selected file</p>
+							<p class="mt-2 text-sm text-slate-400">{uploadedImageName || "No file chosen yet."}</p>
+							<div class="mt-4 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-xs leading-6 text-slate-400">
+								Upload a clear image with one or two hands. The backend will extract MediaPipe landmarks and classify the pose immediately.
+							</div>
+						</div>
+						<div class="rounded-3xl border border-white/10 bg-slate-950/40 p-5">
+							<p class="text-sm font-semibold text-slate-300">Model notes</p>
+							<div class="mt-3 grid gap-3 sm:grid-cols-2">
+								<div class="rounded-2xl bg-white/5 p-4">
+									<p class="text-xs uppercase tracking-[0.28em] text-slate-500">Feature shape</p>
+									<p class="mt-2 text-lg font-black text-white">126</p>
+								</div>
+								<div class="rounded-2xl bg-white/5 p-4">
+									<p class="text-xs uppercase tracking-[0.28em] text-slate-500">Inference mode</p>
+									<p class="mt-2 text-lg font-black text-white">Single frame</p>
+								</div>
+							</div>
+						</div>
+					</div>
+				</div>
+			</section>
+
+			<aside class="space-y-6">
+				<div class="rounded-[2rem] border border-white/10 bg-slate-900/60 p-5 shadow-2xl shadow-slate-950/40 backdrop-blur-xl" in:fade={{ duration: 180 }}>
+					<div class="flex items-center justify-between gap-3">
+						<div>
+							<p class="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-300/80">Current result</p>
+							<h2 class="mt-2 text-2xl font-black text-white">{prediction === "waiting" ? "Awaiting frame" : prediction === "no_hand" ? "No hand detected" : prediction === "uncertain" ? "Uncertain" : prediction}</h2>
+						</div>
+						<div class="rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-right">
+							<p class="text-[0.65rem] uppercase tracking-[0.26em] text-slate-500">Confidence</p>
+							<p class="text-lg font-black text-white">{confidencePct}</p>
+						</div>
+					</div>
+
+					<div class="mt-5 rounded-[1.5rem] border border-white/10 bg-slate-950/70 p-4">
+						<div class="flex items-center justify-between gap-3 text-sm text-slate-300">
+							<span>{handDetected ? `${detectedHands} hand${detectedHands === 1 ? "" : "s"} detected` : "Waiting for landmarks"}</span>
+							<span>{lastUpdated ? `Updated ${lastUpdated}` : "No result yet"}</span>
+						</div>
+						<div class="mt-3 h-2 overflow-hidden rounded-full bg-slate-800">
+							<div class="h-full rounded-full bg-gradient-to-r from-cyan-400 via-indigo-500 to-emerald-400 transition-all duration-300" style={`width: ${confidenceBar}`}></div>
+						</div>
+						{#if prediction === "no_hand"}
+							<p class="mt-3 text-sm leading-6 text-slate-400">Move a hand into the frame. The model only needs one clean snapshot to classify the pose.</p>
+						{:else if prediction === "uncertain"}
+							<p class="mt-3 text-sm leading-6 text-amber-200/80">The landmarks were detected, but the model wants a clearer pose. Try better lighting or a more centered hand.</p>
+						{:else if prediction !== "waiting"}
+							<p class="mt-3 text-sm leading-6 text-emerald-200/80">This prediction comes from the notebook’s Dense MLP classifier running on MediaPipe landmarks, not from a temporal sequence model.</p>
+						{/if}
+					</div>
+
+					<div class="mt-4 grid gap-3 sm:grid-cols-3">
+						{#each [
+							{ label: "Hands", value: handDetected ? String(detectedHands) : "0" },
+							{ label: "Mode", value: backendInfo?.inference_mode ?? "landmarks" },
+							{ label: "Dim", value: backendInfo?.feature_dim ?? 126 },
+						] as metric}
+							<div class="rounded-2xl border border-white/10 bg-white/5 p-4">
+								<p class="text-xs uppercase tracking-[0.28em] text-slate-500">{metric.label}</p>
+								<p class="mt-2 text-lg font-black text-white">{metric.value}</p>
+							</div>
+						{/each}
+					</div>
+
+					<div class="mt-4 rounded-[1.5rem] border border-white/10 bg-slate-950/60 p-4">
+						<div class="flex items-center justify-between gap-3">
+							<p class="text-sm font-semibold text-slate-200">Top candidates</p>
+							<button onclick={() => void speakPrediction(prediction)} class="text-xs font-semibold text-cyan-300 transition hover:text-cyan-200" disabled={prediction === "waiting" || prediction === "no_hand" || prediction === "uncertain"}>Speak</button>
+						</div>
+						<div class="mt-3 space-y-3">
+							{#if topCandidates.length > 0}
+								{#each topCandidates as candidate, index}
+									<div class="rounded-2xl border border-white/10 bg-white/5 p-3">
+										<div class="flex items-center justify-between gap-3 text-sm">
+											<span class="font-semibold text-white">{index + 1}. {candidate.label}</span>
+											<span class="tabular-nums text-slate-300">{Math.round(candidate.confidence * 100)}%</span>
+										</div>
+										<div class="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
+											<div class="h-full rounded-full bg-gradient-to-r from-indigo-500 to-emerald-400" style={`width: ${Math.max(2, candidate.confidence * 100)}%`}></div>
+										</div>
 									</div>
-								{/if}
+								{/each}
+							{:else}
+								<div class="rounded-2xl border border-dashed border-white/10 bg-white/5 p-4 text-sm text-slate-400">
+									The backend will return the top three class probabilities here after the first successful landmark detection.
+								</div>
+							{/if}
+						</div>
+					</div>
+
+					{#if errorMessage}
+						<div class="mt-4 rounded-[1.5rem] border border-rose-500/20 bg-rose-500/10 p-4 text-sm leading-6 text-rose-100">
+							<p class="font-semibold text-rose-200">Notice</p>
+							<p class="mt-1 text-rose-50/90">{errorMessage}</p>
+						</div>
+					{/if}
+				</div>
+
+				<div class="rounded-[2rem] border border-white/10 bg-slate-900/60 p-5 shadow-2xl shadow-slate-950/40 backdrop-blur-xl">
+					<div class="flex items-center justify-between gap-3">
+						<div>
+							<p class="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">Recent predictions</p>
+							<h3 class="mt-2 text-lg font-bold text-white">Live history</h3>
+						</div>
+						<button onclick={resetView} class="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-white/10">Reset</button>
+					</div>
+
+					<div class="mt-4 space-y-3">
+						{#if recentPredictions.length > 0}
+							{#each recentPredictions as item}
+								<div class="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+									<div>
+										<p class="font-bold text-white">{item.label}</p>
+										<p class="text-xs text-slate-500">{item.at}</p>
+									</div>
+									<p class="text-sm font-semibold text-slate-300">{Math.round(item.confidence * 100)}%</p>
+								</div>
+							{/each}
+						{:else}
+							<div class="rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-5 text-sm leading-6 text-slate-400">
+								The history will fill once live inference starts. Your camera is not required for still-image testing, which is handy if you prefer debugging with a single snapshot.
 							</div>
 						{/if}
 					</div>
 				</div>
-
-				<!-- Metrics Breakdown -->
-				<div class="pt-6 grid grid-cols-2 gap-4">
-					<!-- Confidence Metric -->
-					<div
-						class="bg-slate-800/50 rounded-2xl p-4 border border-slate-700/30"
-					>
-						<div
-							class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2"
-						>
-							Confidence
-						</div>
-						<div class="flex items-end gap-2 text-white">
-							<span class="text-2xl font-black leading-none"
-								>{confidencePct}</span
-							>
-						</div>
-
-						<!-- Progress Bar -->
-						<div
-							class="w-full h-1.5 bg-slate-900 rounded-full mt-3 overflow-hidden"
-						>
-							<div
-								class="h-full bg-gradient-to-r from-emerald-400 to-indigo-500 transition-all duration-300 ease-out"
-								style="width: {confidence * 100}%"
-							></div>
-						</div>
-					</div>
-
-					<!-- Frames Metric -->
-					<div
-						class="bg-slate-800/50 rounded-2xl p-4 border border-slate-700/30"
-					>
-						<div
-							class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2"
-						>
-							Frames
-						</div>
-						<div class="flex items-end gap-1 text-white">
-							<span class="text-2xl font-black leading-none"
-								>{framesCollected}</span
-							>
-							<span
-								class="text-sm font-bold text-slate-500 mb-0.5"
-								>/ {maxFrames}</span
-							>
-						</div>
-
-						<!-- Progress Bar -->
-						<div
-							class="w-full h-1.5 bg-slate-900 rounded-full mt-3 overflow-hidden"
-						>
-							<div
-								class="h-full bg-indigo-500 transition-all duration-300 ease-out"
-								style="width: {(framesCollected / maxFrames) * 100}%"
-							></div>
-						</div>
-					</div>
-				</div>
-			</div>
-
-			<!-- Controls Card -->
-			<div
-				class="bg-slate-900/60 backdrop-blur-md border border-slate-700/50 rounded-3xl p-3 shadow-xl flex flex-col gap-3"
-			>
-				{#if !started}
-					<button
-						onclick={startCamera}
-						disabled={backendStatus === "offline"}
-						class="w-full relative py-4 px-6 bg-gradient-to-r from-indigo-500 to-violet-600 hover:from-indigo-400 hover:to-violet-500 disabled:from-slate-800 disabled:to-slate-800 disabled:text-slate-500 text-white font-bold rounded-2xl shadow-lg shadow-indigo-500/25 transition-all duration-300 active:scale-[0.98] group overflow-hidden"
-					>
-						<!-- Button inner highlight -->
-						<div
-							class="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/30 to-transparent"
-						></div>
-						<span
-							class="relative flex items-center justify-center gap-2"
-						>
-							<svg
-								class="w-5 h-5"
-								fill="none"
-								stroke="currentColor"
-								viewBox="0 0 24 24"
-								><path
-									stroke-linecap="round"
-									stroke-linejoin="round"
-									stroke-width="2"
-									d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"
-								/><path
-									stroke-linecap="round"
-									stroke-linejoin="round"
-									stroke-width="2"
-									d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-								/></svg
-							>
-							{backendStatus === "offline"
-								? "Backend Unavailable"
-								: "Initialize Scanner"}
-						</span>
-					</button>
-				{:else}
-					<button
-						onclick={stopCamera}
-						class="w-full py-4 px-6 bg-rose-500/10 hover:bg-rose-500/20 text-rose-500 font-bold rounded-2xl border border-rose-500/20 transition-all duration-200 active:scale-[0.98] flex items-center justify-center gap-2"
-					>
-						<svg
-							class="w-5 h-5"
-							fill="none"
-							stroke="currentColor"
-							viewBox="0 0 24 24"
-							><path
-								stroke-linecap="round"
-								stroke-linejoin="round"
-								stroke-width="2"
-								d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-							/><path
-								stroke-linecap="round"
-								stroke-linejoin="round"
-								stroke-width="2"
-								d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"
-							/></svg
-						>
-						Terminate Scanner
-					</button>
-
-					<button
-						onclick={captureAndPredict}
-						disabled={isProcessing}
-						class="w-full relative py-4 px-6 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 disabled:from-slate-700 disabled:to-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-bold rounded-2xl shadow-lg shadow-emerald-500/25 transition-all duration-300 active:scale-[0.98] group overflow-hidden flex items-center justify-center gap-2"
-					>
-						<!-- Button inner highlight -->
-						<div
-							class="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/30 to-transparent"
-						></div>
-						<span class="relative flex items-center justify-center gap-2">
-							<svg
-								class="w-5 h-5"
-								fill="none"
-								stroke="currentColor"
-								viewBox="0 0 24 24"
-								><path
-									stroke-linecap="round"
-									stroke-linejoin="round"
-									stroke-width="2"
-									d="M14.828 14.828a4 4 0 01-5.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-								/></svg
-							>
-							{isProcessing ? "Processing..." : "Capture & Predict"}
-						</span>
-					</button>
-				{/if}
-
-				<button
-					onclick={resetSession}
-					disabled={!started && prediction === "idle"}
-					class="w-full py-3 px-6 bg-slate-800/80 hover:bg-slate-800 border border-slate-700 hover:border-slate-600 disabled:opacity-50 disabled:cursor-not-allowed text-slate-300 font-medium rounded-2xl transition-all duration-200 active:scale-[0.98] flex items-center justify-center gap-2"
-				>
-					<svg
-						class="w-4 h-4"
-						fill="none"
-						stroke="currentColor"
-						viewBox="0 0 24 24"
-						><path
-							stroke-linecap="round"
-							stroke-linejoin="round"
-							stroke-width="2"
-							d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-						/></svg
-					>
-					Refresh Session Buffer
-				</button>
-			</div>
-		</div>
-	</main>
+			</aside>
+		</main>
+	</div>
 </div>
 
 <style>
-	/* Make the video act like a mirror */
 	.mirror-video {
 		transform: scaleX(-1);
 	}
