@@ -25,6 +25,12 @@
 		top_candidates: PredictionCandidate[];
 	};
 
+	type CapturedLetter = {
+		letter: string;
+		confidence: number;
+		at: string;
+	};
+
 	const API_BASE =
 		(import.meta.env.VITE_API_BASE_URL as string) ||
 		(typeof window !== "undefined" && window.location.hostname !== "localhost"
@@ -33,104 +39,107 @@
 
 	const CAMERA_WIDTH = 640;
 	const CAMERA_HEIGHT = 480;
-	const DEFAULT_CAPTURE_INTERVAL = 240;
-	const SPEAK_THRESHOLD = 0.76;
-	const TOP_HISTORY_COUNT = 6;
+	const MAX_WORD_LENGTH = 5;
+	const FALLBACK_CONFIDENCE_THRESHOLD = 0.4;
+	const TOP_HISTORY_COUNT = 8;
 
 	let videoEl = $state<HTMLVideoElement | null>(null);
 	let canvasEl = $state<HTMLCanvasElement | null>(null);
 	let fileInputEl = $state<HTMLInputElement | null>(null);
-
 	let stream = $state<MediaStream | null>(null);
 	let cameraState = $state<"idle" | "starting" | "live">("idle");
-	let backendStatus = $state<"connecting" | "connected" | "offline">(
-		"connecting",
-	);
+	let backendStatus = $state<"connecting" | "connected" | "offline">("connecting");
+	let backendInfo = $state<BackendHealth | null>(null);
 	let errorMessage = $state("");
 	let isProcessing = $state(false);
-	let liveInferenceEnabled = $state(true);
-	let captureIntervalMs = $state(DEFAULT_CAPTURE_INTERVAL);
-	let speechEnabled = $state(false);
-
+	let isSpeaking = $state(false);
 	let prediction = $state("waiting");
 	let confidence = $state(0);
 	let handDetected = $state(false);
 	let detectedHands = $state(0);
 	let topCandidates = $state<PredictionCandidate[]>([]);
 	let lastUpdated = $state("");
-
-	let backendInfo = $state<BackendHealth | null>(null);
-	let classNames = $state<string[]>([]);
 	let uploadedImageUrl = $state<string | null>(null);
 	let uploadedImageName = $state("");
 	let recentPredictions = $state<Array<{ label: string; confidence: number; at: string }>>([]);
+	let capturedLetters = $state<CapturedLetter[]>([]);
 	let statusTimer: ReturnType<typeof setInterval> | null = null;
-	let captureTimer: ReturnType<typeof setInterval> | null = null;
 	let abortController: AbortController | null = null;
 	let currentAudio: HTMLAudioElement | null = null;
-	let lastSpoken = "";
-	let isSpeaking = false;
+	let currentAudioUrl: string | null = null;
 
+	const confidenceThreshold = $derived(
+		backendInfo?.confidence_threshold ?? FALLBACK_CONFIDENCE_THRESHOLD,
+	);
 	const confidencePct = $derived(`${Math.round(confidence * 100)}%`);
 	const confidenceBar = $derived(`${Math.max(0, Math.min(100, confidence * 100))}%`);
+	const builtWord = $derived(capturedLetters.map((item) => item.letter).join(""));
+	const wordReady = $derived(capturedLetters.length === MAX_WORD_LENGTH);
+	const lettersRemaining = $derived(Math.max(0, MAX_WORD_LENGTH - capturedLetters.length));
+	const lastCaptured = $derived(capturedLetters[capturedLetters.length - 1] ?? null);
 	const cameraStatusLabel = $derived(
 		cameraState === "live"
-			? "Camera active"
+			? "Camera ready"
 			: cameraState === "starting"
 				? "Starting camera"
 				: "Camera idle",
 	);
+
+	function isLetterPrediction(value: string) {
+		return /^[A-Z]$/.test(value);
+	}
+
+	function pushRecentPrediction(label: string, value: number) {
+		recentPredictions = [
+			{ label, confidence: value, at: new Date().toLocaleTimeString() },
+			...recentPredictions,
+		].slice(0, TOP_HISTORY_COUNT);
+	}
+
+	function addCapturedLetter(letter: string, value: number) {
+		capturedLetters = [
+			...capturedLetters,
+			{ letter, confidence: value, at: new Date().toLocaleTimeString() },
+		].slice(0, MAX_WORD_LENGTH);
+	}
+
+	function removeLastLetter() {
+		capturedLetters = capturedLetters.slice(0, -1);
+	}
+
+	function clearWord() {
+		capturedLetters = [];
+	}
+
 	async function checkBackendHealth() {
 		try {
 			const res = await fetch(`${API_BASE}/health`, {
 				method: "GET",
 				headers: { Accept: "application/json" },
-				signal: AbortSignal.timeout(5000),
 				cache: "no-store",
+				signal: AbortSignal.timeout(5000),
 			});
+
 			if (!res.ok) {
 				backendStatus = "offline";
 				return;
 			}
 
 			backendStatus = "connected";
-			const data = (await res.json()) as BackendHealth;
-			backendInfo = data;
-			classNames = data.classes ?? [];
+			backendInfo = (await res.json()) as BackendHealth;
 			if (errorMessage.includes("backend") || errorMessage.includes("offline")) {
 				errorMessage = "";
 			}
 		} catch {
 			backendStatus = "offline";
-			if (!stream && !uploadedImageUrl && !errorMessage) {
+			if (!errorMessage) {
 				errorMessage = "Backend is offline or still waking up.";
 			}
 		}
 	}
 
-	function clearCaptureTimer() {
-		if (captureTimer) {
-			clearInterval(captureTimer);
-			captureTimer = null;
-		}
-	}
-
-	function updateCaptureTimer() {
-		clearCaptureTimer();
-		if (stream && cameraState === "live" && liveInferenceEnabled) {
-			captureTimer = setInterval(() => {
-				void captureAndPredict();
-			}, captureIntervalMs);
-		}
-	}
-
 	function captureBase64(): string | null {
-		if (
-			!videoEl ||
-			!canvasEl ||
-			videoEl.videoWidth === 0 ||
-			videoEl.videoHeight === 0
-		) {
+		if (!videoEl || !canvasEl || videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
 			return null;
 		}
 
@@ -145,47 +154,72 @@
 	}
 
 	function captureUploadedBase64(): string | null {
-		if (!uploadedImageUrl) return null;
-		return uploadedImageUrl.split(",")[1] ?? null;
+		return uploadedImageUrl?.split(",")[1] ?? null;
 	}
 
-	function pushRecentPrediction(label: string, value: number) {
-		recentPredictions = [
-			{ label, confidence: value, at: new Date().toLocaleTimeString() },
-			...recentPredictions,
-		].slice(0, TOP_HISTORY_COUNT);
+	async function readFileAsDataUrl(file: File) {
+		return await new Promise<string>((resolve, reject) => {
+			const reader = new FileReader();
+			reader.onload = () => resolve(String(reader.result));
+			reader.onerror = () => reject(reader.error);
+			reader.readAsDataURL(file);
+		});
 	}
 
-	async function speakPrediction(text: string) {
+	async function speakText(text: string) {
 		if (currentAudio) {
 			currentAudio.pause();
 			currentAudio.currentTime = 0;
 		}
+		if (currentAudioUrl) {
+			URL.revokeObjectURL(currentAudioUrl);
+			currentAudioUrl = null;
+		}
 
 		isSpeaking = true;
 		try {
-			const res = await fetch(`${API_BASE}/tts?text=${encodeURIComponent(text)}`);
-			if (!res.ok) throw new Error(`TTS failed with ${res.status}`);
-			const blob = await res.blob();
-			const audioUrl = URL.createObjectURL(blob);
-			currentAudio = new Audio(audioUrl);
+			const response = await fetch(`${API_BASE}/tts?text=${encodeURIComponent(text)}`);
+			if (!response.ok) throw new Error(`TTS failed with ${response.status}`);
+
+			const blob = await response.blob();
+			currentAudioUrl = URL.createObjectURL(blob);
+			currentAudio = new Audio(currentAudioUrl);
 			currentAudio.onended = () => {
 				isSpeaking = false;
-				URL.revokeObjectURL(audioUrl);
+				if (currentAudioUrl) {
+					URL.revokeObjectURL(currentAudioUrl);
+					currentAudioUrl = null;
+				}
 			};
 			currentAudio.onerror = () => {
 				isSpeaking = false;
-				URL.revokeObjectURL(audioUrl);
+				if (currentAudioUrl) {
+					URL.revokeObjectURL(currentAudioUrl);
+					currentAudioUrl = null;
+				}
 			};
 			await currentAudio.play();
 		} catch (error) {
 			console.error("TTS error:", error);
+			if (typeof window !== "undefined" && "speechSynthesis" in window) {
+				window.speechSynthesis.cancel();
+				const utterance = new SpeechSynthesisUtterance(text);
+				utterance.onend = () => {
+					isSpeaking = false;
+				};
+				utterance.onerror = () => {
+					isSpeaking = false;
+				};
+				window.speechSynthesis.speak(utterance);
+				return;
+			}
+			errorMessage = "Could not start audio playback.";
 			isSpeaking = false;
 		}
 	}
 
-	async function predictFromBase64(imageBase64: string) {
-		if (!imageBase64 || isProcessing || backendStatus === "offline") return;
+	async function predictFromBase64(imageBase64: string): Promise<PredictionResponse | null> {
+		if (!imageBase64 || isProcessing || backendStatus === "offline") return null;
 
 		isProcessing = true;
 		errorMessage = "";
@@ -212,56 +246,61 @@
 			topCandidates = data.top_candidates ?? [];
 			lastUpdated = new Date().toLocaleTimeString();
 
-			if (data.prediction !== "no_hand" && data.prediction !== "uncertain") {
+			if (isLetterPrediction(data.prediction)) {
 				pushRecentPrediction(data.prediction, data.confidence);
-				if (
-					speechEnabled &&
-					data.confidence >= SPEAK_THRESHOLD &&
-					data.prediction !== lastSpoken &&
-					!isSpeaking
-				) {
-					lastSpoken = data.prediction;
-					void speakPrediction(data.prediction);
-				}
 			}
 
 			if (data.prediction === "no_hand") {
 				errorMessage = "No hand landmarks were detected. Try moving closer to the camera.";
 			}
+
+			return data;
 		} catch (error) {
 			if ((error as { name?: string }).name !== "AbortError") {
 				console.error("Inference error:", error);
 				errorMessage = "Inference failed. Check the backend and camera permissions.";
 			}
+			return null;
 		} finally {
 			isProcessing = false;
 		}
 	}
 
 	async function captureAndPredict() {
-		if (cameraState !== "live") return;
-		const imageBase64 = captureBase64();
-		if (imageBase64) {
-			await predictFromBase64(imageBase64);
+		const imageBase64 = cameraState === "live" ? captureBase64() : captureUploadedBase64();
+		if (!imageBase64) {
+			if (!uploadedImageUrl && cameraState !== "live") {
+				errorMessage = "Start the camera or upload an image before capturing a letter.";
+			}
+			return null;
 		}
+		return await predictFromBase64(imageBase64);
 	}
 
-	async function analyzeUploadedImage() {
-		const imageBase64 = captureUploadedBase64();
-		if (!imageBase64) {
-			errorMessage = "Upload a photo first, then try again.";
+	async function captureAndAddLetter() {
+		const result = await captureAndPredict();
+		if (!result) return;
+
+		if (!isLetterPrediction(result.prediction)) {
+			errorMessage =
+				result.prediction === "uncertain"
+					? "The model needs a clearer pose before adding a letter."
+					: "No usable letter was detected for the word builder.";
 			return;
 		}
-		await predictFromBase64(imageBase64);
-	}
 
-	async function readFileAsDataUrl(file: File) {
-		return await new Promise<string>((resolve, reject) => {
-			const reader = new FileReader();
-			reader.onload = () => resolve(String(reader.result));
-			reader.onerror = () => reject(reader.error);
-			reader.readAsDataURL(file);
-		});
+		if (result.confidence < confidenceThreshold) {
+			errorMessage = `That prediction is below the ${Math.round(confidenceThreshold * 100)}% threshold. Try again.`;
+			return;
+		}
+
+		if (capturedLetters.length >= MAX_WORD_LENGTH) {
+			errorMessage = "Your 5-letter word is already full. Clear it to build another one.";
+			return;
+		}
+
+		addCapturedLetter(result.prediction, result.confidence);
+		errorMessage = "";
 	}
 
 	async function onUploadImage(event: Event) {
@@ -302,8 +341,6 @@
 			}
 
 			cameraState = "live";
-			updateCaptureTimer();
-			lastSpoken = "";
 		} catch (error) {
 			cameraState = "idle";
 			stream = null;
@@ -314,14 +351,12 @@
 	function stopCamera() {
 		abortController?.abort();
 		abortController = null;
-		clearCaptureTimer();
 
 		if (stream) {
 			for (const track of stream.getTracks()) {
 				track.stop();
 			}
 		}
-
 		if (videoEl) {
 			videoEl.srcObject = null;
 		}
@@ -333,7 +368,12 @@
 		handDetected = false;
 		detectedHands = 0;
 		topCandidates = [];
-		lastSpoken = "";
+		lastUpdated = "";
+	}
+
+	async function speakCapturedWord() {
+		if (!wordReady || !builtWord) return;
+		await speakText(builtWord);
 	}
 
 	async function resetView() {
@@ -341,13 +381,10 @@
 		uploadedImageUrl = null;
 		uploadedImageName = "";
 		recentPredictions = [];
+		capturedLetters = [];
 		lastUpdated = "";
 		errorMessage = "";
 		await checkBackendHealth();
-	}
-
-	function syncControls() {
-		updateCaptureTimer();
 	}
 
 	onMount(() => {
@@ -357,22 +394,25 @@
 
 	onDestroy(() => {
 		if (statusTimer) clearInterval(statusTimer);
-		clearCaptureTimer();
 		stopCamera();
-		currentAudio?.pause();
+		if (currentAudio) currentAudio.pause();
+		if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
+		if (typeof window !== "undefined" && "speechSynthesis" in window) {
+			window.speechSynthesis.cancel();
+		}
 	});
 </script>
 
 <svelte:head>
-	<title>ASL Prism • Landmark MLP Inference</title>
+	<title>ASL Prism • 5-letter word builder</title>
 	<meta
 		name="description"
-		content="A polished ASL alphabet app powered by a single-frame MediaPipe landmark MLP."
+		content="Capture five ASL alphabet predictions, build a word, and play it aloud."
 	/>
 </svelte:head>
 
 <div class="min-h-screen overflow-hidden bg-slate-950 text-slate-100">
-	<div class="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(99,102,241,0.20),transparent_32%),radial-gradient(circle_at_right,rgba(16,185,129,0.10),transparent_20%),linear-gradient(180deg,#020617_0%,#0f172a_100%)]"></div>
+	<div class="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(59,130,246,0.22),transparent_30%),radial-gradient(circle_at_right,rgba(16,185,129,0.12),transparent_18%),linear-gradient(180deg,#020617_0%,#0f172a_100%)]"></div>
 	<div class="absolute inset-0 opacity-40 bg-[linear-gradient(rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[size:52px_52px]"></div>
 
 	<div class="relative z-10 mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-8 px-4 py-6 sm:px-6 lg:px-8">
@@ -385,9 +425,9 @@
 				</div>
 				<div>
 					<p class="text-xs font-semibold uppercase tracking-[0.35em] text-cyan-300/80">ASL Prism</p>
-					<h1 class="mt-1 text-3xl font-black tracking-tight text-white sm:text-4xl">Single-frame landmark inference</h1>
-					<p class="mt-2 max-w-2xl text-sm leading-6 text-slate-300">
-						The app now mirrors the notebook model: MediaPipe extracts 126 hand-landmark features and the MLP classifies each frame instantly.
+					<h1 class="mt-1 text-3xl font-black tracking-tight text-white sm:text-4xl">Build a 5-letter word from capture predictions</h1>
+					<p class="mt-2 max-w-3xl text-sm leading-6 text-slate-300">
+						Capture one ASL letter at a time, stack five predictions into a word, and play the completed word aloud when you're done.
 					</p>
 				</div>
 			</div>
@@ -403,13 +443,13 @@
 			</div>
 		</header>
 
-		<main class="grid gap-6 xl:grid-cols-[1.35fr_0.85fr]">
+		<main class="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
 			<section class="space-y-6">
 				<div class="rounded-[2rem] border border-white/10 bg-slate-900/55 p-4 shadow-2xl shadow-slate-950/40 backdrop-blur-xl sm:p-5">
 					<div class="mb-4 flex items-center justify-between gap-3">
 						<div>
-							<h2 class="text-lg font-bold text-white">Live camera</h2>
-							<p class="text-sm text-slate-400">Capture a frame, extract landmarks, and classify instantly.</p>
+							<h2 class="text-lg font-bold text-white">Capture a letter</h2>
+							<p class="text-sm text-slate-400">Use the camera or an uploaded image, then add the prediction to your 5-letter word.</p>
 						</div>
 						<div class="rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.24em] text-slate-300">
 							{cameraStatusLabel}
@@ -424,9 +464,9 @@
 										<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
 									</svg>
 								</div>
-								<p class="text-2xl font-black text-white">Camera idle</p>
+								<p class="text-2xl font-black text-white">Ready when you are</p>
 								<p class="mt-2 max-w-lg text-sm leading-6 text-slate-400">
-									Start the camera for live inference, or upload a still image below to run a one-frame prediction.
+									Start the camera for live capture, or upload a still image and use that as your next letter.
 								</p>
 							</div>
 						{/if}
@@ -435,16 +475,11 @@
 							<img src={uploadedImageUrl} alt="Uploaded preview" class="h-full w-full bg-slate-950 object-contain" />
 						{/if}
 
-						<video
-							bind:this={videoEl}
-							playsinline
-							muted
-							class="mirror-video h-full w-full object-cover {cameraState === 'live' ? 'opacity-100' : 'opacity-0'}"
-						></video>
+						<video bind:this={videoEl} playsinline muted class="mirror-video h-full w-full object-cover {cameraState === 'live' ? 'opacity-100' : 'opacity-0'}"></video>
 
 						<div class="pointer-events-none absolute inset-0 border border-cyan-400/15"></div>
 						<div class="pointer-events-none absolute left-4 top-4 rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.25em] text-cyan-200">
-							MLP • 126-dim landmarks
+							126-dim landmark MLP
 						</div>
 						{#if handDetected}
 							<div class="pointer-events-none absolute right-4 top-4 rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.25em] text-emerald-200">
@@ -457,51 +492,45 @@
 					<canvas bind:this={canvasEl} class="hidden"></canvas>
 
 					<div class="mt-4 grid gap-3 sm:grid-cols-3">
-						<button
-							onclick={startCamera}
-							disabled={backendStatus === "offline" || cameraState === "starting"}
-							class="rounded-2xl bg-gradient-to-r from-indigo-500 to-cyan-500 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-cyan-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
-						>
+						<button onclick={startCamera} disabled={backendStatus === "offline" || cameraState === "starting"} class="rounded-2xl bg-gradient-to-r from-indigo-500 to-cyan-500 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-cyan-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50">
 							{cameraState === "starting" ? "Opening camera…" : "Start camera"}
 						</button>
-						<button
-							onclick={stopCamera}
-							disabled={cameraState !== "live" && cameraState !== "starting"}
-							class="rounded-2xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm font-bold text-rose-300 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
-						>
-							Stop camera
+						<button onclick={cameraState === "live" ? stopCamera : resetView} class="rounded-2xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm font-bold text-rose-300 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50">
+							{cameraState === "live" ? "Stop camera" : "Reset all"}
 						</button>
-						<button
-							onclick={() => void (uploadedImageUrl ? analyzeUploadedImage() : captureAndPredict())}
-							disabled={backendStatus === "offline" || isProcessing || (!uploadedImageUrl && cameraState !== "live")}
-							class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-bold text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
-						>
-							{isProcessing ? "Analyzing…" : uploadedImageUrl ? "Analyze image" : "Capture now"}
+						<button onclick={() => void captureAndAddLetter()} disabled={backendStatus === "offline" || isProcessing || (!uploadedImageUrl && cameraState !== "live") || wordReady} class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-bold text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50">
+							{isProcessing ? "Capturing…" : uploadedImageUrl && cameraState !== "live" ? "Analyze image + add letter" : "Capture frame + add letter"}
 						</button>
 					</div>
 
 					<div class="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-						<label class="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
-							<span>Live inference</span>
-							<input type="checkbox" bind:checked={liveInferenceEnabled} onchange={syncControls} class="h-4 w-4 rounded border-slate-600 bg-slate-900 text-cyan-500" />
-						</label>
-						<label class="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
-							<span>Voice cues</span>
-							<input type="checkbox" bind:checked={speechEnabled} class="h-4 w-4 rounded border-slate-600 bg-slate-900 text-cyan-500" />
-						</label>
 						<div class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
 							<div class="flex items-center justify-between gap-3">
-								<span>Capture interval</span>
-								<span class="font-semibold text-cyan-200">{captureIntervalMs} ms</span>
+								<span>Word slots</span>
+								<span class="font-semibold text-emerald-200">{capturedLetters.length}/{MAX_WORD_LENGTH}</span>
 							</div>
-							<input type="range" min="120" max="1000" step="20" bind:value={captureIntervalMs} oninput={syncControls} class="mt-2 w-full accent-cyan-400" />
+							<p class="mt-2 text-xs text-slate-400">Add one captured prediction per slot, then play the finished word.</p>
 						</div>
 						<div class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
 							<div class="flex items-center justify-between gap-3">
 								<span>Threshold</span>
-								<span class="font-semibold text-emerald-200">{backendInfo ? `${Math.round(backendInfo.confidence_threshold * 100)}%` : "40%"}</span>
+								<span class="font-semibold text-emerald-200">{Math.round(confidenceThreshold * 100)}%</span>
 							</div>
-							<p class="mt-2 text-xs text-slate-400">The backend keeps low-confidence frames as uncertain.</p>
+							<p class="mt-2 text-xs text-slate-400">Only confident letter predictions can be added.</p>
+						</div>
+						<div class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
+							<div class="flex items-center justify-between gap-3">
+								<span>Current capture</span>
+								<span class="font-semibold text-cyan-200">{prediction}</span>
+							</div>
+							<p class="mt-2 text-xs text-slate-400">The latest notebook-style landmark prediction.</p>
+						</div>
+						<div class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
+							<div class="flex items-center justify-between gap-3">
+								<span>Confidence</span>
+								<span class="font-semibold text-cyan-200">{confidencePct}</span>
+							</div>
+							<p class="mt-2 text-xs text-slate-400">Use the capture button to lock a letter into the word.</p>
 						</div>
 					</div>
 				</div>
@@ -510,7 +539,7 @@
 					<div class="mb-4 flex items-center justify-between gap-3">
 						<div>
 							<h2 class="text-lg font-bold text-white">Upload a still image</h2>
-							<p class="text-sm text-slate-400">Great for testing the notebook-style single-frame pipeline.</p>
+							<p class="text-sm text-slate-400">Great for testing the single-frame pipeline before building a word.</p>
 						</div>
 						<div class="flex items-center gap-3">
 							<button onclick={() => fileInputEl?.click()} class="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-semibold text-slate-100 transition hover:bg-white/10">Choose image</button>
@@ -523,19 +552,19 @@
 							<p class="text-sm font-semibold text-slate-300">Selected file</p>
 							<p class="mt-2 text-sm text-slate-400">{uploadedImageName || "No file chosen yet."}</p>
 							<div class="mt-4 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-xs leading-6 text-slate-400">
-								Upload a clear image with one or two hands. The backend will extract MediaPipe landmarks and classify the pose immediately.
+								Upload a clear hand pose and capture it as the next letter in your word.
 							</div>
 						</div>
 						<div class="rounded-3xl border border-white/10 bg-slate-950/40 p-5">
-							<p class="text-sm font-semibold text-slate-300">Model notes</p>
+							<p class="text-sm font-semibold text-slate-300">Capture notes</p>
 							<div class="mt-3 grid gap-3 sm:grid-cols-2">
 								<div class="rounded-2xl bg-white/5 p-4">
 									<p class="text-xs uppercase tracking-[0.28em] text-slate-500">Feature shape</p>
 									<p class="mt-2 text-lg font-black text-white">126</p>
 								</div>
 								<div class="rounded-2xl bg-white/5 p-4">
-									<p class="text-xs uppercase tracking-[0.28em] text-slate-500">Inference mode</p>
-									<p class="mt-2 text-lg font-black text-white">Single frame</p>
+									<p class="text-xs uppercase tracking-[0.28em] text-slate-500">Word length</p>
+									<p class="mt-2 text-lg font-black text-white">5 letters</p>
 								</div>
 							</div>
 						</div>
@@ -547,8 +576,8 @@
 				<div class="rounded-[2rem] border border-white/10 bg-slate-900/60 p-5 shadow-2xl shadow-slate-950/40 backdrop-blur-xl" in:fade={{ duration: 180 }}>
 					<div class="flex items-center justify-between gap-3">
 						<div>
-							<p class="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-300/80">Current result</p>
-							<h2 class="mt-2 text-2xl font-black text-white">{prediction === "waiting" ? "Awaiting frame" : prediction === "no_hand" ? "No hand detected" : prediction === "uncertain" ? "Uncertain" : prediction}</h2>
+							<p class="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-300/80">Current prediction</p>
+							<h2 class="mt-2 text-2xl font-black text-white">{prediction === "waiting" ? "Awaiting capture" : prediction === "no_hand" ? "No hand detected" : prediction === "uncertain" ? "Uncertain" : prediction}</h2>
 						</div>
 						<div class="rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-right">
 							<p class="text-[0.65rem] uppercase tracking-[0.26em] text-slate-500">Confidence</p>
@@ -567,29 +596,69 @@
 						{#if prediction === "no_hand"}
 							<p class="mt-3 text-sm leading-6 text-slate-400">Move a hand into the frame. The model only needs one clean snapshot to classify the pose.</p>
 						{:else if prediction === "uncertain"}
-							<p class="mt-3 text-sm leading-6 text-amber-200/80">The landmarks were detected, but the model wants a clearer pose. Try better lighting or a more centered hand.</p>
+							<p class="mt-3 text-sm leading-6 text-amber-200/80">The hand was detected, but the pose needs to be clearer before it can be added to your word.</p>
 						{:else if prediction !== "waiting"}
-							<p class="mt-3 text-sm leading-6 text-emerald-200/80">This prediction comes from the notebook’s Dense MLP classifier running on MediaPipe landmarks, not from a temporal sequence model.</p>
+							<p class="mt-3 text-sm leading-6 text-emerald-200/80">This result comes from the notebook’s Dense MLP classifier running on MediaPipe landmarks.</p>
 						{/if}
 					</div>
 
-					<div class="mt-4 grid gap-3 sm:grid-cols-3">
-						{#each [
-							{ label: "Hands", value: handDetected ? String(detectedHands) : "0" },
-							{ label: "Mode", value: backendInfo?.inference_mode ?? "landmarks" },
-							{ label: "Dim", value: backendInfo?.feature_dim ?? 126 },
-						] as metric}
-							<div class="rounded-2xl border border-white/10 bg-white/5 p-4">
-								<p class="text-xs uppercase tracking-[0.28em] text-slate-500">{metric.label}</p>
-								<p class="mt-2 text-lg font-black text-white">{metric.value}</p>
+					<div class="mt-4 rounded-[1.5rem] border border-white/10 bg-slate-950/60 p-4">
+						<div class="flex items-center justify-between gap-3">
+							<div>
+								<p class="text-sm font-semibold text-slate-200">Your 5-letter word</p>
+								<p class="text-xs text-slate-500">Capture letters one by one, then play the word aloud.</p>
 							</div>
-						{/each}
+							<span class="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-slate-200">{capturedLetters.length}/{MAX_WORD_LENGTH}</span>
+						</div>
+
+						<div class="mt-4 grid grid-cols-5 gap-2">
+							{#each Array.from({ length: MAX_WORD_LENGTH }, (_, index) => index) as index}
+								<div class="flex aspect-square flex-col items-center justify-center rounded-2xl border border-white/10 bg-white/5 text-center">
+									<p class="text-2xl font-black text-white">{capturedLetters[index]?.letter ?? "—"}</p>
+									<p class="mt-1 text-[0.65rem] uppercase tracking-[0.28em] text-slate-500">{index + 1}</p>
+								</div>
+							{/each}
+						</div>
+
+						<div class="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4">
+							<p class="text-xs uppercase tracking-[0.28em] text-slate-500">Built word</p>
+							<p class="mt-2 break-all text-3xl font-black text-white">{builtWord || "_____"}</p>
+							<p class="mt-2 text-sm text-slate-400">{wordReady ? "Word complete — press play to hear it." : `${lettersRemaining} more letter${lettersRemaining === 1 ? "" : "s"} needed.`}</p>
+						</div>
+
+						<div class="mt-4 flex flex-wrap gap-3">
+							<button onclick={speakCapturedWord} disabled={!wordReady || isSpeaking || backendStatus === "offline"} class="rounded-2xl bg-gradient-to-r from-emerald-500 to-cyan-500 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-cyan-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50">
+								{isSpeaking ? "Playing…" : "Play word"}
+							</button>
+							<button onclick={removeLastLetter} disabled={capturedLetters.length === 0} class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-bold text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50">Undo</button>
+							<button onclick={clearWord} disabled={capturedLetters.length === 0} class="rounded-2xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm font-bold text-rose-300 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50">Clear word</button>
+						</div>
+
+						<div class="mt-4 flex flex-wrap gap-2 text-sm text-slate-300">
+							<span class="rounded-full border border-white/10 bg-white/5 px-3 py-1">Threshold {Math.round(confidenceThreshold * 100)}%</span>
+							<span class="rounded-full border border-white/10 bg-white/5 px-3 py-1">Last capture {lastCaptured ? lastCaptured.letter : "—"}</span>
+						</div>
+					</div>
+
+					<div class="mt-4 grid gap-3 sm:grid-cols-3">
+						<div class="rounded-2xl border border-white/10 bg-white/5 p-4">
+							<p class="text-xs uppercase tracking-[0.28em] text-slate-500">Hands</p>
+							<p class="mt-2 text-lg font-black text-white">{handDetected ? String(detectedHands) : "0"}</p>
+						</div>
+						<div class="rounded-2xl border border-white/10 bg-white/5 p-4">
+							<p class="text-xs uppercase tracking-[0.28em] text-slate-500">Mode</p>
+							<p class="mt-2 text-lg font-black text-white">{backendInfo?.inference_mode ?? "landmarks"}</p>
+						</div>
+						<div class="rounded-2xl border border-white/10 bg-white/5 p-4">
+							<p class="text-xs uppercase tracking-[0.28em] text-slate-500">Dim</p>
+							<p class="mt-2 text-lg font-black text-white">{backendInfo?.feature_dim ?? 126}</p>
+						</div>
 					</div>
 
 					<div class="mt-4 rounded-[1.5rem] border border-white/10 bg-slate-950/60 p-4">
 						<div class="flex items-center justify-between gap-3">
 							<p class="text-sm font-semibold text-slate-200">Top candidates</p>
-							<button onclick={() => void speakPrediction(prediction)} class="text-xs font-semibold text-cyan-300 transition hover:text-cyan-200" disabled={prediction === "waiting" || prediction === "no_hand" || prediction === "uncertain"}>Speak</button>
+							<span class="text-xs font-semibold text-cyan-300">{prediction === "waiting" ? "Capture a pose" : `Latest: ${prediction}`}</span>
 						</div>
 						<div class="mt-3 space-y-3">
 							{#if topCandidates.length > 0}
@@ -606,7 +675,7 @@
 								{/each}
 							{:else}
 								<div class="rounded-2xl border border-dashed border-white/10 bg-white/5 p-4 text-sm text-slate-400">
-									The backend will return the top three class probabilities here after the first successful landmark detection.
+									The backend will show the top three class probabilities here after the first successful landmark detection.
 								</div>
 							{/if}
 						</div>
@@ -623,18 +692,18 @@
 				<div class="rounded-[2rem] border border-white/10 bg-slate-900/60 p-5 shadow-2xl shadow-slate-950/40 backdrop-blur-xl">
 					<div class="flex items-center justify-between gap-3">
 						<div>
-							<p class="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">Recent predictions</p>
-							<h3 class="mt-2 text-lg font-bold text-white">Live history</h3>
+							<p class="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">Recent captures</p>
+							<h3 class="mt-2 text-lg font-bold text-white">Word-building history</h3>
 						</div>
 						<button onclick={resetView} class="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-white/10">Reset</button>
 					</div>
 
 					<div class="mt-4 space-y-3">
-						{#if recentPredictions.length > 0}
-							{#each recentPredictions as item}
+						{#if capturedLetters.length > 0}
+							{#each capturedLetters as item, index}
 								<div class="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
 									<div>
-										<p class="font-bold text-white">{item.label}</p>
+										<p class="font-bold text-white">{index + 1}. {item.letter}</p>
 										<p class="text-xs text-slate-500">{item.at}</p>
 									</div>
 									<p class="text-sm font-semibold text-slate-300">{Math.round(item.confidence * 100)}%</p>
@@ -642,7 +711,7 @@
 							{/each}
 						{:else}
 							<div class="rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-5 text-sm leading-6 text-slate-400">
-								The history will fill once live inference starts. Your camera is not required for still-image testing, which is handy if you prefer debugging with a single snapshot.
+								Capture five letters to build a word. Once the fifth slot is filled, the play button becomes available.
 							</div>
 						{/if}
 					</div>
