@@ -67,6 +67,13 @@
 	let abortController: AbortController | null = null;
 	let currentAudio: HTMLAudioElement | null = null;
 	let currentAudioUrl: string | null = null;
+	let activeTab = $state<"asl" | "stt">("asl");
+	let sttSupported = $state(false);
+	let sttListening = $state(false);
+	let sttTranscript = $state("");
+	let sttInterim = $state("");
+	let sttError = $state("");
+	let speechRecognition: any = null;
 
 	const confidenceThreshold = $derived(
 		backendInfo?.confidence_threshold ?? FALLBACK_CONFIDENCE_THRESHOLD,
@@ -376,6 +383,90 @@
 		await speakText(builtWord);
 	}
 
+	function getSpeechRecognitionCtor() {
+		if (typeof window === "undefined") return null;
+		const browserWindow = window as Window & {
+			SpeechRecognition?: new () => any;
+			webkitSpeechRecognition?: new () => any;
+		};
+		return browserWindow.SpeechRecognition ?? browserWindow.webkitSpeechRecognition ?? null;
+	}
+
+	function stopTranscription() {
+		if (speechRecognition) {
+			speechRecognition.onresult = null;
+			speechRecognition.onerror = null;
+			speechRecognition.onend = null;
+			speechRecognition.stop();
+		}
+		sttListening = false;
+	}
+
+	function clearTranscript() {
+		sttTranscript = "";
+		sttInterim = "";
+		sttError = "";
+	}
+
+	async function copyTranscript() {
+		const text = [sttTranscript, sttInterim].filter(Boolean).join(" ").trim();
+		if (!text || typeof navigator === "undefined" || !navigator.clipboard) return;
+		await navigator.clipboard.writeText(text);
+	}
+
+	function startTranscription() {
+		sttError = "";
+		const SpeechRecognitionCtor = getSpeechRecognitionCtor();
+		if (!SpeechRecognitionCtor) {
+			sttError = "Speech recognition is not supported in this browser.";
+			return;
+		}
+
+		stopTranscription();
+		speechRecognition = new SpeechRecognitionCtor();
+		speechRecognition.lang = "en-US";
+		speechRecognition.continuous = false;
+		speechRecognition.interimResults = true;
+		speechRecognition.maxAlternatives = 1;
+
+		speechRecognition.onresult = (event: any) => {
+			let finalChunk = "";
+			let interimChunk = "";
+			for (let i = event.resultIndex; i < event.results.length; i += 1) {
+				const transcript = event.results[i][0]?.transcript ?? "";
+				if (event.results[i].isFinal) {
+					finalChunk += `${transcript} `;
+				} else {
+					interimChunk += `${transcript} `;
+				}
+			}
+			if (finalChunk.trim()) {
+				sttTranscript = `${sttTranscript} ${finalChunk}`.trim();
+			}
+			sttInterim = interimChunk.trim();
+		};
+
+		speechRecognition.onerror = (event: any) => {
+			sttError = event?.error
+				? `Transcription error: ${event.error}`
+				: "Transcription failed.";
+			sttListening = false;
+		};
+
+		speechRecognition.onend = () => {
+			sttListening = false;
+			sttInterim = "";
+		};
+
+		sttListening = true;
+		try {
+			speechRecognition.start();
+		} catch {
+			sttListening = false;
+			sttError = "Could not start speech recognition.";
+		}
+	}
+
 	async function resetView() {
 		stopCamera();
 		uploadedImageUrl = null;
@@ -390,11 +481,13 @@
 	onMount(() => {
 		void checkBackendHealth();
 		statusTimer = setInterval(() => void checkBackendHealth(), 10000);
+		sttSupported = getSpeechRecognitionCtor() !== null;
 	});
 
 	onDestroy(() => {
 		if (statusTimer) clearInterval(statusTimer);
 		stopCamera();
+		stopTranscription();
 		if (currentAudio) currentAudio.pause();
 		if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
 		if (typeof window !== "undefined" && "speechSynthesis" in window) {
@@ -443,6 +536,16 @@
 			</div>
 		</header>
 
+		<div class="flex flex-wrap items-center gap-3 rounded-3xl border border-white/10 bg-white/5 p-2 shadow-lg shadow-slate-950/30 backdrop-blur-xl">
+			<button onclick={() => (activeTab = "asl")} class="rounded-2xl px-4 py-2 text-sm font-semibold transition {activeTab === 'asl' ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-slate-200'}">
+				ASL capture
+			</button>
+			<button onclick={() => (activeTab = "stt")} class="rounded-2xl px-4 py-2 text-sm font-semibold transition {activeTab === 'stt' ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-slate-200'}">
+				Speech to text
+			</button>
+		</div>
+
+		{#if activeTab === "asl"}
 		<main class="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
 			<section class="space-y-6">
 				<div class="rounded-[2rem] border border-white/10 bg-slate-900/55 p-4 shadow-2xl shadow-slate-950/40 backdrop-blur-xl sm:p-5">
@@ -718,6 +821,80 @@
 				</div>
 			</aside>
 		</main>
+		{:else}
+		<main class="grid gap-6 xl:grid-cols-[1.1fr_0.9fr]">
+			<section class="rounded-[2rem] border border-white/10 bg-slate-900/55 p-5 shadow-2xl shadow-slate-950/40 backdrop-blur-xl">
+				<div class="flex items-center justify-between gap-3">
+					<div>
+						<p class="text-xs font-semibold uppercase tracking-[0.35em] text-cyan-300/80">Speech to text</p>
+						<h2 class="mt-2 text-2xl font-black text-white">Transcribe microphone audio</h2>
+						<p class="mt-2 text-sm leading-6 text-slate-400">Use your browser’s speech recognition to turn spoken audio into text. This stays separate from the ASL capture flow.</p>
+					</div>
+					<div class="rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold uppercase tracking-[0.25em] text-slate-300">
+						{sttSupported ? (sttListening ? "Listening" : "Ready") : "Unsupported"}
+					</div>
+				</div>
+
+				<div class="mt-5 grid gap-3 sm:grid-cols-3">
+					<button onclick={sttListening ? stopTranscription : startTranscription} class="rounded-2xl bg-gradient-to-r from-indigo-500 to-cyan-500 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-cyan-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50" disabled={!sttSupported && !sttListening}>
+						{sttListening ? "Stop listening" : "Start listening"}
+					</button>
+					<button onclick={copyTranscript} class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-bold text-slate-100 transition hover:bg-white/10" disabled={!sttTranscript && !sttInterim}>
+						Copy transcript
+					</button>
+					<button onclick={clearTranscript} class="rounded-2xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm font-bold text-rose-300 transition hover:bg-rose-500/20" disabled={!sttTranscript && !sttInterim}>
+						Clear
+					</button>
+				</div>
+
+				<div class="mt-5 rounded-[1.5rem] border border-white/10 bg-slate-950/70 p-4">
+					<p class="text-sm font-semibold text-slate-200">Live transcript</p>
+					<div class="mt-3 min-h-48 rounded-2xl border border-dashed border-white/10 bg-white/5 p-4 text-base leading-7 text-slate-100">
+						{#if sttTranscript}
+							<p class="whitespace-pre-wrap">{sttTranscript}{sttInterim ? ` ${sttInterim}` : ""}</p>
+						{:else if sttInterim}
+							<p class="whitespace-pre-wrap text-slate-300">{sttInterim}</p>
+						{:else}
+							<p class="text-slate-500">Start listening and speak clearly. Your transcription will appear here.</p>
+						{/if}
+					</div>
+					<div class="mt-3 flex flex-wrap gap-2 text-sm text-slate-300">
+						<span class="rounded-full border border-white/10 bg-white/5 px-3 py-1">Language en-US</span>
+						<span class="rounded-full border border-white/10 bg-white/5 px-3 py-1">Interim results on</span>
+					</div>
+				</div>
+			</section>
+
+			<aside class="space-y-6">
+				<div class="rounded-[2rem] border border-white/10 bg-slate-900/60 p-5 shadow-2xl shadow-slate-950/40 backdrop-blur-xl">
+					<div class="flex items-center justify-between gap-3">
+						<div>
+							<p class="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">Status</p>
+							<h3 class="mt-2 text-lg font-bold text-white">Speech recognition</h3>
+						</div>
+						<span class="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold text-slate-200">{sttSupported ? "Supported" : "Not supported"}</span>
+					</div>
+
+					<div class="mt-4 space-y-3 text-sm leading-6 text-slate-300">
+						<div class="rounded-2xl border border-white/10 bg-white/5 p-4">
+							<p class="font-semibold text-white">How it works</p>
+							<p class="mt-1 text-slate-400">Click start, speak into your microphone, and the browser will stream text into the transcript box.</p>
+						</div>
+						<div class="rounded-2xl border border-white/10 bg-white/5 p-4">
+							<p class="font-semibold text-white">Current state</p>
+							<p class="mt-1 text-slate-400">{sttListening ? "Listening for audio input." : "Idle and ready to listen."}</p>
+						</div>
+						{#if sttError}
+							<div class="rounded-2xl border border-rose-500/20 bg-rose-500/10 p-4 text-rose-100">
+								<p class="font-semibold text-rose-200">Notice</p>
+								<p class="mt-1">{sttError}</p>
+							</div>
+						{/if}
+					</div>
+				</div>
+			</aside>
+		</main>
+		{/if}
 	</div>
 </div>
 
