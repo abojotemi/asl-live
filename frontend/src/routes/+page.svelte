@@ -219,7 +219,7 @@
 	}
 
 	async function predictFromBase64(imageBase64: string): Promise<PredictionResponse | null> {
-		if (!imageBase64 || isProcessing || backendStatus === "offline") return null;
+		if (!imageBase64 || isProcessing) return null;
 
 		isProcessing = true;
 		errorMessage = "";
@@ -492,13 +492,13 @@
 					<canvas bind:this={canvasEl} class="hidden"></canvas>
 
 					<div class="mt-4 grid gap-3 sm:grid-cols-3">
-						<button onclick={startCamera} disabled={backendStatus === "offline" || cameraState === "starting"} class="rounded-2xl bg-gradient-to-r from-indigo-500 to-cyan-500 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-cyan-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50">
+						<button onclick={startCamera} disabled={cameraState === "starting"} class="rounded-2xl bg-gradient-to-r from-indigo-500 to-cyan-500 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-cyan-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50">
 							{cameraState === "starting" ? "Opening camera…" : "Start camera"}
 						</button>
 						<button onclick={cameraState === "live" ? stopCamera : resetView} class="rounded-2xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm font-bold text-rose-300 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50">
 							{cameraState === "live" ? "Stop camera" : "Reset all"}
 						</button>
-						<button onclick={() => void captureAndAddLetter()} disabled={backendStatus === "offline" || isProcessing || (!uploadedImageUrl && cameraState !== "live") || wordReady} class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-bold text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50">
+						<button onclick={() => void captureAndAddLetter()} disabled={isProcessing || (!uploadedImageUrl && cameraState !== "live") || wordReady} class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-bold text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50">
 							{isProcessing ? "Capturing…" : uploadedImageUrl && cameraState !== "live" ? "Analyze image + add letter" : "Capture frame + add letter"}
 						</button>
 					</div>
@@ -627,7 +627,7 @@
 						</div>
 
 						<div class="mt-4 flex flex-wrap gap-3">
-							<button onclick={speakCapturedWord} disabled={!wordReady || isSpeaking || backendStatus === "offline"} class="rounded-2xl bg-gradient-to-r from-emerald-500 to-cyan-500 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-cyan-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50">
+							<button onclick={speakCapturedWord} disabled={!wordReady || isSpeaking} class="rounded-2xl bg-gradient-to-r from-emerald-500 to-cyan-500 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-cyan-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50">
 								{isSpeaking ? "Playing…" : "Play word"}
 							</button>
 							<button onclick={removeLastLetter} disabled={capturedLetters.length === 0} class="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-bold text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50">Undo</button>
