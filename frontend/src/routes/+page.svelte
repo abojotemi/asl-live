@@ -828,7 +828,7 @@
 					<div>
 						<p class="text-xs font-semibold uppercase tracking-[0.35em] text-cyan-300/80">Speech to text</p>
 						<h2 class="mt-2 text-2xl font-black text-white">Transcribe microphone audio</h2>
-						<p class="mt-2 text-sm leading-6 text-slate-400">Use your browser’s speech recognition to turn spoken audio into text. This stays separate from the ASL capture flow.</p>
+						<p class="mt-2 text-sm leading-6 text-slate-400">Use your browser’s speech recognition to turn spoken audio into text.</p>
 					</div>
 					<div class="rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold uppercase tracking-[0.25em] text-slate-300">
 						{sttSupported ? (sttListening ? "Listening" : "Ready") : "Unsupported"}
